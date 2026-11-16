@@ -393,7 +393,6 @@
  "services|Some": "Vissa",
  "shelf|Off": "Av",
  "talkback|Sunrise {time}": "Soluppgång {time}",
- "the TV asked for TLS (wireless debugging); use USB debugging": "tv:n bad om TLS (trådlös felsökning); använd USB-felsökning",
  "the TV rejected the app's key": "tv:n avvisade appens nyckel",
  "the TV's ADB didn't respond": "tv:ns ADB svarade inte",
  "the TV's factory home screen": "tv:ns hemskärm från fabriken",

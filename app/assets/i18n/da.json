@@ -393,7 +393,6 @@
  "services|Some": "Nogle",
  "shelf|Off": "Fra",
  "talkback|Sunrise {time}": "Solopgang {time}",
- "the TV asked for TLS (wireless debugging); use USB debugging": "tv'et bad om TLS (trådløs fejlfinding); brug USB-fejlfinding",
  "the TV rejected the app's key": "tv'et afviste appens nøgle",
  "the TV's ADB didn't respond": "tv'ets ADB svarede ikke",
  "the TV's factory home screen": "tv'ets startskærm fra fabrikken",

@@ -393,7 +393,6 @@
  "services|Some": "Osa",
  "shelf|Off": "Pois",
  "talkback|Sunrise {time}": "Aurinko nousee {time}",
- "the TV asked for TLS (wireless debugging); use USB debugging": "televisio pyysi TLS:ää (langaton vianetsintä); käytä USB-vianetsintää",
  "the TV rejected the app's key": "televisio hylkäsi sovelluksen avaimen",
  "the TV's ADB didn't respond": "television ADB ei vastannut",
  "the TV's factory home screen": "television tehtaan aloitusnäyttö",

@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<voice-interaction-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:sessionService="io.freemytv.VoiceAssistantSessionService"
+    android:recognitionService="io.freemytv.VoiceRecognitionBridgeService"
+    android:settingsActivity="io.freemytv.SettingsActivity"
+    android:supportsAssist="true" />

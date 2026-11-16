@@ -393,7 +393,6 @@
  "services|Some": "Sommige",
  "shelf|Off": "Uit",
  "talkback|Sunrise {time}": "Zonsopkomst {time}",
- "the TV asked for TLS (wireless debugging); use USB debugging": "de tv vroeg om TLS (draadloze foutopsporing); gebruik USB-foutopsporing",
  "the TV rejected the app's key": "de tv weigerde de sleutel van de app",
  "the TV's ADB didn't respond": "de ADB van de tv reageerde niet",
  "the TV's factory home screen": "het fabrieksstartscherm van de tv",

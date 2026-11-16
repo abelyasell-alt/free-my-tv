@@ -75,7 +75,7 @@ final class Recs {
     /** How often Trakt is asked whether the account changed (marked watched, the watchlist): one small request. */
     private static final long TRAKT_EVERY = 10 * 60_000L;
     /** Bump when what is saved for each title changes (the saved list is discarded and fetched again). */
-    private static final int CACHE_VERSION = 6;   // 6: lists of up to POOL + TRAKT_MAX
+    private static final int CACHE_VERSION = 7;   // 7: dual streaming-app / Stremio pick routing
     /** TMDB's titles in the list (trending, then the new releases), as on main. */
     private static final int POOL = 24;
     /** Trakt's titles in the list: about what the tabs show of them (now(): up to 2 in 5 in progress, 3 in 5 liked). */
@@ -101,6 +101,7 @@ final class Recs {
         {"globoplay", "globoplay", "com.globo.globotv"},
         {"max", "max", "com.wbd.stream"},
         {"max", "max", "com.hbo.hbonow"},
+        {"max", "max", "com.hbo.hbomax"},
         {"apple tv", "appletv", "com.apple.atve.androidtv.appletv"},
         {"apple tv", "appletv", "com.apple.atve.sony.appletv"},   // Sony's own build
         {"apple tv", "appletv", "com.apple.atve.amazon.appletv"},
@@ -202,6 +203,8 @@ final class Recs {
     private volatile String listLanguage = "";   // language used for the saved titles, genres and texts
     private volatile String traktActivity = "";  // Trakt's last change when the picks were fetched
     private volatile long traktCheckedAt;
+    private final Map<String, JwMatch> jwCache = new HashMap<>();
+    private long jwCacheStamp, jwCacheAt;
 
     private Recs(Context c) {
         context = c;
@@ -243,7 +246,7 @@ final class Recs {
     void removeListener(Listener l) { listeners.remove(l); }
 
     static boolean hasKey(Context c) {
-        return !key().isEmpty();
+        return !key().isEmpty() || Trakt.available() || GeminiAi.hasKey(c) || Config.OPEN_IN_STREMIO;
     }
 
     private static volatile String cachedKey = "";
@@ -519,7 +522,10 @@ final class Recs {
     }
 
     private File imageFile(Pick p) {
-        return new File(new File(context.getCacheDir(), "recs"), p.backdrop.replace("/", ""));
+        String name = p.backdrop.startsWith("http")
+                ? "b_" + Integer.toHexString(p.backdrop.hashCode()) + ".jpg"
+                : p.backdrop.replace("/", "");
+        return new File(new File(context.getCacheDir(), "recs"), name);
     }
 
     /** With a key: fetches the list if stale or the time of day (morning/afternoon/night) changed; then the details. */
@@ -694,6 +700,10 @@ final class Recs {
     // MARK: - TMDB
 
     private void fetchList(int p, Map<String, Pick> known) throws Exception {
+        if (key().isEmpty()) {
+            fetchListWithoutTmdb(p, known);
+            return;
+        }
         // Whether a service we know is on the TV (and not hidden): with none, and none found by name, the error says so.
         boolean any = false;
         for (String[] s : SERVICES) any |= installed(s[2]);
@@ -748,9 +758,10 @@ final class Recs {
         String common = "&language=" + lang() + "&watch_region=" + REGION + "&with_watch_monetization_types=flatrate&include_adult=false"
                 + "&sort_by=popularity.desc&with_watch_providers=" + URLEncoder.encode(ids.toString(), "UTF-8")
                 + (Prefs.hideAnimation() ? "&without_genres=" + ANIMATION : "");
-        // 1. Trending this week (TMDB goes by what people are watching and searching for right now), only what is
-        //    on one of the TV's services: the details say where (and are then ready).
+        // 1. Trending this week (TMDB goes by what people are watching and searching for right now), keeping titles on
+        //    installed streaming apps ahead of Stremio fallbacks so subscriptions are never crowded out.
         List<Pick> hotMovies = new ArrayList<>(), hotShows = new ArrayList<>();
+        List<Pick> stremioMovies = new ArrayList<>(), stremioShows = new ArrayList<>();
         for (String kind : new String[] {"movie", "tv"}) {
             JSONArray hot = get("/trending/" + kind + "/week?language=" + lang()).getJSONArray("results");
             List<Pick> candidates = new ArrayList<>();
@@ -762,7 +773,9 @@ final class Recs {
                 } catch (Exception e) {
                     continue;
                 }
-                if (pick.pkg != null) (kind.equals("movie") ? hotMovies : hotShows).add(pick);
+                if (pick.pkg == null) continue;
+                if ("stremio".equals(pick.app)) (kind.equals("movie") ? stremioMovies : stremioShows).add(pick);
+                else (kind.equals("movie") ? hotMovies : hotShows).add(pick);
             }
         }
         // 2. Recent releases on the TV's services: movies from the past year and shows with a new episode in the
@@ -824,15 +837,389 @@ final class Recs {
         for (Pick x : progress) if (seen.add(key(x))) list.add(x);
         alternate(list, seen, listMovies, listShows, TRAKT_MAX);
         alternate(list, seen, recMovies, recShows, TRAKT_MAX);
-        int ours = list.size();
-        alternate(list, seen, hotMovies, hotShows, ours + POOL);
-        alternate(list, seen, newMovies, newShows, ours + POOL);
+        finalizePool(list, seen, hotMovies, hotShows, newMovies, newShows, stremioMovies, stremioShows);
         if (list.isEmpty()) throw new IOException("TMDB returned no recommendations");
         picks = list;
         traktStamp = account;
         period = p;
         listAt = System.currentTimeMillis();
         listLanguage = Ui.language;
+    }
+
+    /** Injects interactive Gemini AI picks right at the front of the Home Screen cards and saves them. */
+    void setAiPicks(List<Pick> aiList) {
+        if (aiList == null || aiList.isEmpty()) return;
+        List<Pick> merged = new ArrayList<>();
+        Set<String> seen = new HashSet<>();
+        for (Pick p : aiList) {
+            p.mine = PROGRESS;
+            try {
+                download(p);
+            } catch (Exception e) {
+                AppLog.w("ai pick image: " + e.getMessage());
+            }
+            if (seen.add(key(p))) merged.add(p);
+        }
+        for (Pick p : picks) {
+            if (seen.add(key(p))) merged.add(p);
+        }
+        picks = merged;
+        listAt = System.currentTimeMillis();
+        save();
+        writeStatus();
+        notifyListeners();
+    }
+
+    /** Resolves a single Gemini AI JSON recommendation into a full Pick with streaming-app-first dual routing. */
+    Pick resolveAiPick(JSONObject item) {
+        try {
+            String title = item.optString("title", "").trim();
+            String orig = item.optString("original_title", title).trim();
+            String rawKind = item.optString("kind", "movie").toLowerCase(Locale.ROOT);
+            String kind = (rawKind.contains("tv") || rawKind.contains("serie") || rawKind.contains("show")) ? "tv" : "movie";
+            String imdb = item.optString("imdb_id", "").trim();
+            String genre = item.optString("genre", "").trim();
+            int year = item.optInt("year", 0);
+            String duration = item.optString("duration", "").trim();
+            String serviceKey = item.optString("service", "").toLowerCase(Locale.ROOT).trim();
+            String why = item.optString("why", "✨ Recomendado por Gemini IA").trim();
+            if (title.isEmpty()) return null;
+
+            if (!key().isEmpty()) {
+                // With TMDB key: search TMDB for exact ID and watch/providers details
+                String q = URLEncoder.encode(orig.isEmpty() ? title : orig, "UTF-8");
+                JSONArray results = get("/search/" + kind + "?query=" + q + "&language=" + lang()).optJSONArray("results");
+                if (results != null && results.length() > 0) {
+                    Pick p = new Pick();
+                    p.kind = kind;
+                    p.id = results.getJSONObject(0).optInt("id");
+                    p.title = title;
+                    p.tag = why;
+                    p.mine = LIKED;
+                    fetchDetails(p);
+                    if (p.pkg != null && p.backdrop != null) {
+                        download(p);
+                        return p;
+                    }
+                    return null;
+                }
+            }
+
+            // Without TMDB key (or if TMDB search missed): resolve metadata via Cinemeta + JustWatch CO/region availability
+            int id = 0;
+            String backdrop = "", poster = "";
+            if (!imdb.matches("tt\\d+")) {
+                JSONObject meta = cinemetaSearch(orig.isEmpty() ? title : orig, kind);
+                if (meta == null && !orig.equalsIgnoreCase(title)) meta = cinemetaSearch(title, kind);
+                if (meta != null) {
+                    imdb = meta.optString("imdb_id", meta.optString("id", ""));
+                    id = meta.optInt("moviedb_id", 0);
+                    backdrop = meta.optString("background", "");
+                    poster = meta.optString("poster", "");
+                }
+            }
+            JwMatch jw = justWatchLookup(kind, title, orig, imdb, id, serviceKey);
+            if (jw != null && jw.matched) {
+                if (!imdb.matches("tt\\d+") && jw.imdb != null && jw.imdb.matches("tt\\d+")) imdb = jw.imdb;
+                if (id <= 0 && jw.tmdbId > 0) id = jw.tmdbId;
+                if (backdrop.isEmpty() && jw.backdrop != null) backdrop = jw.backdrop;
+                if (poster.isEmpty() && jw.poster != null) poster = jw.poster;
+                if (genre.isEmpty() && jw.genre != null) genre = jw.genre;
+                if (duration.isEmpty() && jw.duration != null) duration = jw.duration;
+            }
+            if (id <= 0 && imdb.matches("tt\\d+")) id = Math.max(1, Integer.parseInt(imdb.substring(2)));
+            if (id <= 0) id = Math.max(1, (kind + ":" + title).hashCode() & 0x7fffffff);
+            if (backdrop.isEmpty() && imdb.matches("tt\\d+")) {
+                backdrop = "https://images.metahub.space/background/medium/" + imdb + "/img";
+            }
+            if (poster.isEmpty() && imdb.matches("tt\\d+")) {
+                poster = "https://images.metahub.space/poster/medium/" + imdb + "/img";
+            }
+            poster = poster.replace("/poster/small/", "/poster/medium/");
+            if (backdrop.isEmpty()) return null;
+
+            Pick p = new Pick();
+            p.id = id;
+            p.kind = kind;
+            p.title = title;
+            p.backdrop = backdrop;
+            p.poster = poster;
+            p.tag = why;
+            p.mine = LIKED;
+            if (!applyDualService(p, imdb, jw, serviceKey)) return null;
+
+            List<String> parts = new ArrayList<>();
+            if (year > 1900) parts.add(String.valueOf(year));
+            if (!why.isEmpty()) parts.add(why);
+            if (kind.equals("tv")) parts.add(Ui.tr("Series"));
+            if (!genre.isEmpty()) parts.add(genre);
+            if (!duration.isEmpty()) parts.add(duration);
+            if (p.app != null) parts.add(name(p.app));
+            p.meta = String.join(" · ", parts);
+            p.detailed = true;
+            download(p);
+            return p;
+        } catch (Exception e) {
+            AppLog.w("resolveAiPick: " + e.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * Assigns the installed streaming app if JustWatch confirmed availability in REGION; falls back to Stremio only when
+     * JustWatch confirmed the title is not on any installed app (or when the TV has no installed subscription apps).
+     */
+    private boolean applyDualService(Pick p, String imdb, JwMatch jw, String suggestedService) {
+        if (jw != null && jw.matched) {
+            if (jw.app != null && jw.pkg != null) {
+                p.app = jw.app;
+                p.pkg = jw.pkg;
+                p.link = jw.link;
+                return true;
+            }
+            return assignStremio(p, imdb);
+        }
+        // Without confirmed dual availability, keep an installed app if specified rather than guessing into Stremio.
+        if (suggestedService != null && !suggestedService.isEmpty() && !"stremio".equals(suggestedService)) {
+            String[] s = service(suggestedService, 0);
+            if (s != null && installed(s[2])) {
+                p.app = s[1];
+                p.pkg = s[2];
+                return true;
+            }
+        }
+        return !hasInstalledService() && assignStremio(p, imdb);
+    }
+
+    private boolean assignStremio(Pick p, String imdb) {
+        if (!stremio()) return false;
+        p.app = "stremio";
+        p.pkg = STREMIO;
+        p.link = stremioLink(p.kind, imdb, p.title);
+        return p.link != null;
+    }
+
+    private static String stremioLink(String kind, String imdb, String title) {
+        if (imdb != null && imdb.startsWith("tt")) {
+            return "stremio:///detail/" + ("movie".equals(kind) ? "movie" : "series") + "/" + imdb;
+        }
+        try {
+            return "stremio:///search?search=" + URLEncoder.encode(title == null ? "" : title, "UTF-8").replace("+", "%20");
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** Builds the recommendation list using Trakt + Gemini AI + Cinemeta when no TMDB key is configured. */
+    private void fetchListWithoutTmdb(int p, Map<String, Pick> known) throws Exception {
+        long account = Trakt.stamp(context);
+        Trakt.Lists trakt = null;
+        if (account != 0) {
+            try {
+                trakt = Trakt.lists(context);
+            } catch (Exception e) {
+                AppLog.w("trakt (no-tmdb): " + e.getMessage());
+            }
+        }
+        final Set<String> watched = trakt == null ? new HashSet<>() : trakt.watched;
+        if (trakt != null) {
+            traktActivity = trakt.activity;
+            traktCheckedAt = System.currentTimeMillis();
+        }
+
+        List<Pick> progress = new ArrayList<>(), listMovies = new ArrayList<>(), listShows = new ArrayList<>();
+        List<Pick> recMovies = new ArrayList<>(), recShows = new ArrayList<>();
+        if (trakt != null) {
+            int few = MAX_CARDS * 2 / 5, movieCount = 0, showCount = 0;
+            for (Trakt.Progress pr : trakt.progress) {
+                boolean movie = pr.key.startsWith("movie:");
+                if ((movie ? movieCount : showCount) >= few) continue;
+                String tag = pr.season == 0 ? Ui.tr("Continue watching")
+                        : pr.paused ? Ui.trf("Continue: S{s} E{e}", "s", pr.season, "e", pr.episode)
+                        : Ui.trf("Up next: S{s} E{e}", "s", pr.season, "e", pr.episode);
+                if (fromTraktCinemeta(pr.key, tag, PROGRESS, progress, trakt, known)) {
+                    if (movie) movieCount++;
+                    else showCount++;
+                }
+            }
+            int each = (TRAKT_MAX - progress.size() + 1) / 2;
+            for (String k : trakt.watchlistMovies) if (listMovies.size() < each && !watched.contains(k)) fromTraktCinemeta(k, Ui.tr("On your watchlist"), LIKED, listMovies, trakt, known);
+            for (String k : trakt.watchlistShows) if (listShows.size() < each && !watched.contains(k)) fromTraktCinemeta(k, Ui.tr("On your watchlist"), LIKED, listShows, trakt, known);
+            for (String k : trakt.recommendedMovies) if (listMovies.size() + recMovies.size() < each && !watched.contains(k)) fromTraktCinemeta(k, Ui.tr("Recommended on Trakt"), LIKED, recMovies, trakt, known);
+            for (String k : trakt.recommendedShows) if (listShows.size() + recShows.size() < each && !watched.contains(k)) fromTraktCinemeta(k, Ui.tr("Recommended on Trakt"), LIKED, recShows, trakt, known);
+        }
+
+        // Also ask Gemini AI for personalized picks based on Trakt taste!
+        if (GeminiAi.hasKey(context)) {
+            try {
+                String taste = trakt != null && !trakt.tasteTitles.isEmpty()
+                        ? String.join(", ", trakt.tasteTitles)
+                        : Trakt.tasteSummary(context);
+                List<Pick> aiPicks = GeminiAi.fetchAutoPicks(context, taste);
+                for (Pick ai : aiPicks) {
+                    if (watched.contains(key(ai))) continue;
+                    if ("movie".equals(ai.kind)) recMovies.add(0, ai);
+                    else recShows.add(0, ai);
+                }
+            } catch (Exception e) {
+                AppLog.w("gemini auto picks: " + e.getMessage());
+            }
+        }
+
+        List<Pick> hotAppMovies = new ArrayList<>(), hotAppShows = new ArrayList<>();
+        List<Pick> stremioMovies = new ArrayList<>(), stremioShows = new ArrayList<>();
+        boolean jwOk = justWatchPopular("movie", watched, hotAppMovies, stremioMovies);
+        jwOk |= justWatchPopular("tv", watched, hotAppShows, stremioShows);
+        if (!jwOk && !hasInstalledService() && stremio()) {
+            stremioMovies = cinemetaTop("movie", watched);
+            stremioShows = cinemetaTop("tv", watched);
+        }
+
+        List<Pick> list = new ArrayList<>();
+        Set<String> seen = new HashSet<>();
+        for (Pick x : progress) if (seen.add(key(x))) list.add(x);
+        alternate(list, seen, recMovies, recShows, TRAKT_MAX + 4);
+        alternate(list, seen, listMovies, listShows, TRAKT_MAX + 8);
+        finalizePool(list, seen, hotAppMovies, hotAppShows, null, null, stremioMovies, stremioShows);
+        if (list.isEmpty()) throw new IOException("No se pudieron obtener recomendaciones");
+        picks = list;
+        traktStamp = account;
+        period = p;
+        listAt = System.currentTimeMillis();
+        listLanguage = Ui.language;
+    }
+
+    private boolean fromTraktCinemeta(String k, String tag, int mine, List<Pick> out, Trakt.Lists trakt, Map<String, Pick> known) {
+        Pick p = new Pick();
+        p.kind = k.substring(0, k.indexOf(':'));
+        p.id = Integer.parseInt(k.substring(k.indexOf(':') + 1));
+        p.tag = tag;
+        p.mine = mine;
+        if (reuse(p, known) && p.pkg != null && p.backdrop != null && (!STREMIO.equals(p.pkg) || stremio())) {
+            out.add(p);
+            return true;
+        }
+        String imdb = trakt.imdbIds.get(k);
+        String fallbackTitle = trakt.titles.getOrDefault(k, "");
+        if ((imdb == null || !imdb.startsWith("tt")) && !fallbackTitle.isEmpty()) {
+            JSONObject found = cinemetaSearch(fallbackTitle, p.kind);
+            if (found != null) imdb = found.optString("imdb_id", found.optString("id", ""));
+        }
+        p.title = fallbackTitle;
+        String genre = "", length = "";
+        if (imdb != null && imdb.startsWith("tt")) {
+            p.backdrop = "https://images.metahub.space/background/medium/" + imdb + "/img";
+            p.poster = "https://images.metahub.space/poster/medium/" + imdb + "/img";
+            try {
+                String type = p.kind.equals("movie") ? "movie" : "series";
+                JSONObject meta = httpJson("https://v3-cinemeta.strem.io/meta/" + type + "/" + imdb + ".json").optJSONObject("meta");
+                if (meta != null) {
+                    if (p.title.isEmpty()) p.title = meta.optString("name", fallbackTitle);
+                    JSONArray genres = meta.optJSONArray("genres");
+                    if (genres == null) genres = meta.optJSONArray("genre");
+                    if (genres != null && genres.length() > 0) genre = genre(genres.optString(0, ""));
+                    length = meta.optString("runtime", "");
+                    String bg = meta.optString("background", "");
+                    String po = meta.optString("poster", "");
+                    if (!bg.isEmpty()) p.backdrop = bg;
+                    if (!po.isEmpty()) p.poster = po.replace("/poster/small/", "/poster/medium/");
+                }
+            } catch (Exception ignored) {
+            }
+        }
+        JwMatch jw = justWatchLookup(p.kind, p.title, fallbackTitle, imdb, p.id, null);
+        if (jw != null && jw.matched) {
+            if (p.title == null || p.title.isEmpty()) p.title = jw.title;
+            if ((imdb == null || !imdb.startsWith("tt")) && jw.imdb != null && jw.imdb.startsWith("tt")) imdb = jw.imdb;
+            if ((p.backdrop == null || p.backdrop.isEmpty()) && jw.backdrop != null) p.backdrop = jw.backdrop;
+            if (p.backdrop == null && imdb != null && imdb.startsWith("tt")) p.backdrop = "https://images.metahub.space/background/medium/" + imdb + "/img";
+            if ((p.poster == null || p.poster.isEmpty()) && imdb != null && imdb.startsWith("tt")) p.poster = "https://images.metahub.space/poster/medium/" + imdb + "/img";
+            if (genre.isEmpty() && jw.genre != null) genre = jw.genre;
+            if (length.isEmpty() && jw.duration != null) length = jw.duration;
+        }
+        if (p.title == null || p.title.isEmpty() || p.backdrop == null || p.backdrop.isEmpty()) return false;
+        if (!applyDualService(p, imdb, jw, null)) return false;
+        List<String> parts = new ArrayList<>();
+        if (p.tag != null) parts.add(p.tag);
+        if (p.kind.equals("tv")) parts.add(Ui.tr("Series"));
+        if (!genre.isEmpty()) parts.add(genre);
+        if (!length.isEmpty()) parts.add(length);
+        if (p.app != null) parts.add(name(p.app));
+        p.meta = String.join(" · ", parts);
+        p.detailed = true;
+        out.add(p);
+        return true;
+    }
+
+    private List<Pick> cinemetaTop(String kind, Set<String> watched) {
+        List<Pick> out = new ArrayList<>();
+        if (!stremio()) return out;
+        try {
+            String type = kind.equals("movie") ? "movie" : "series";
+            JSONArray metas = httpJson("https://cinemeta-catalogs.strem.io/top/catalog/" + type + "/top.json").optJSONArray("metas");
+            for (int i = 0; metas != null && i < metas.length() && out.size() < 16; i++) {
+                JSONObject m = metas.optJSONObject(i);
+                if (m == null) continue;
+                String imdb = m.optString("imdb_id", m.optString("id", ""));
+                if (!imdb.startsWith("tt")) continue;
+                int id = m.optInt("moviedb_id", 0);
+                if (id <= 0) id = Math.max(1, Integer.parseInt(imdb.substring(2)));
+                String k = kind + ":" + id;
+                if (watched.contains(k)) continue;
+                String bg = m.optString("background", "https://images.metahub.space/background/medium/" + imdb + "/img");
+                String po = m.optString("poster", "https://images.metahub.space/poster/medium/" + imdb + "/img")
+                        .replace("/poster/small/", "/poster/medium/");
+                Pick p = new Pick();
+                p.id = id;
+                p.kind = kind;
+                p.title = m.optString("name", "");
+                if (p.title.isEmpty()) continue;
+                p.backdrop = bg;
+                p.poster = po;
+                if (!assignStremio(p, imdb)) continue;
+                List<String> parts = new ArrayList<>();
+                if (kind.equals("tv")) parts.add(Ui.tr("Series"));
+                JSONArray genres = m.optJSONArray("genres");
+                if (genres == null) genres = m.optJSONArray("genre");
+                if (genres != null && genres.length() > 0) parts.add(genre(genres.optString(0, "")));
+                String runtime = m.optString("runtime", "");
+                if (!runtime.isEmpty()) parts.add(runtime);
+                if (p.app != null) parts.add(name(p.app));
+                p.meta = String.join(" · ", parts);
+                p.detailed = true;
+                out.add(p);
+            }
+        } catch (Exception e) {
+            AppLog.w("cinemeta top (" + kind + "): " + e.getMessage());
+        }
+        return out;
+    }
+
+    private static JSONObject cinemetaSearch(String query, String kind) {
+        try {
+            String type = kind.equals("movie") ? "movie" : "series";
+            String url = "https://v3-cinemeta.strem.io/catalog/" + type + "/top/search="
+                    + URLEncoder.encode(query, "UTF-8").replace("+", "%20") + ".json";
+            JSONArray metas = httpJson(url).optJSONArray("metas");
+            if (metas != null && metas.length() > 0) return metas.getJSONObject(0);
+        } catch (Exception ignored) {
+        }
+        return null;
+    }
+
+    private static JSONObject httpJson(String url) throws Exception {
+        HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+        c.setInstanceFollowRedirects(true);
+        c.setConnectTimeout(8000);
+        c.setReadTimeout(10000);
+        c.setRequestProperty("Accept", "application/json");
+        try {
+            int code = c.getResponseCode();
+            if (code != 200) throw new IOException("HTTP " + code);
+            return new JSONObject(read(c.getInputStream()));
+        } finally {
+            c.disconnect();
+        }
     }
 
     /** A Trakt title ("movie:603") with its details, added to `out` when it's on one of the TV's services. */
@@ -919,6 +1306,329 @@ final class Recs {
         }
     }
 
+    /**
+     * Fills the home pool keeping installed streaming subscriptions ahead of Stremio fallbacks while still leaving a
+     * small showcase slice for verified trending titles not on any installed subscription app.
+     */
+    private void finalizePool(List<Pick> list, Set<String> seen,
+            List<Pick> appMovies, List<Pick> appShows,
+            List<Pick> newMovies, List<Pick> newShows,
+            List<Pick> stremioMovies, List<Pick> stremioShows) {
+        int ours = list.size();
+        int stremioAvail = stremioMovies.size() + stremioShows.size();
+        int stremioReserve = stremio() && stremioAvail > 0 ? Math.min(4, stremioAvail) : 0;
+        int appCap = ours + Math.max(0, POOL - stremioReserve);
+        alternate(list, seen, appMovies, appShows, appCap);
+        if (newMovies != null && newShows != null) alternate(list, seen, newMovies, newShows, appCap);
+        alternate(list, seen, stremioMovies, stremioShows, ours + POOL);
+        if (newMovies != null && newShows != null) alternate(list, seen, newMovies, newShows, ours + POOL);
+        alternate(list, seen, appMovies, appShows, ours + POOL);
+    }
+
+    // MARK: - JustWatch (per-title streaming availability and direct app links for REGION without requiring TMDB)
+
+    private static final String JUSTWATCH_API = "https://apis.justwatch.com/graphql";
+    private static final String JW_FIELDS =
+            "node { objectType content(country: $country, language: $language) { "
+            + "title originalTitle runtime genres { translation(language: $language) shortName } "
+            + "externalIds { imdbId tmdbId } backdrops { backdropUrl } } "
+            + "offers(country: $country, platform: WEB, filter: {monetizationTypes: [FLATRATE]}) { "
+            + "monetizationType standardWebURL package { clearName technicalName packageId } } }";
+    private static final String JW_POPULAR_QUERY =
+            "query($country: Country!, $language: Language!, $types: [ObjectType!]) { "
+            + "popularTitles(country: $country, first: 40, filter: {objectTypes: $types, monetizationTypes: [FLATRATE]}) { "
+            + "edges { " + JW_FIELDS + " } } }";
+    private static final String JW_SEARCH_QUERY =
+            "query($country: Country!, $language: Language!, $types: [ObjectType!], $query: String!) { "
+            + "popularTitles(country: $country, first: 6, filter: {objectTypes: $types, searchQuery: $query}) { "
+            + "edges { " + JW_FIELDS + " } } }";
+
+    private static final class JwMatch {
+        boolean matched, animated;
+        String app, pkg, link, imdb, title, backdrop, poster, genre, duration;
+        int tmdbId;
+    }
+
+    private static String justWatchCountry() {
+        return REGION == null || REGION.trim().isEmpty() ? "US" : REGION.trim().toUpperCase(Locale.ROOT);
+    }
+
+    private static String justWatchLanguage() {
+        String lang = Ui.language == null ? "en" : Ui.language.replaceAll("-.*", "").toLowerCase(Locale.ROOT);
+        return lang.isEmpty() ? "en" : lang;
+    }
+
+    private static JSONArray justWatchEdges(String query, JSONObject variables) throws Exception {
+        HttpURLConnection c = (HttpURLConnection) new URL(JUSTWATCH_API).openConnection();
+        c.setRequestMethod("POST");
+        c.setDoOutput(true);
+        c.setConnectTimeout(8000);
+        c.setReadTimeout(10000);
+        c.setRequestProperty("Content-Type", "application/json");
+        c.setRequestProperty("Accept", "application/json");
+        c.setRequestProperty("User-Agent", "Mozilla/5.0");
+        byte[] body = new JSONObject().put("query", query).put("variables", variables).toString().getBytes(StandardCharsets.UTF_8);
+        c.setFixedLengthStreamingMode(body.length);
+        try {
+            c.getOutputStream().write(body);
+            int code = c.getResponseCode();
+            if (code != 200) throw new IOException("JustWatch HTTP " + code);
+            JSONObject root = new JSONObject(read(c.getInputStream()));
+            JSONObject data = root.optJSONObject("data");
+            JSONObject pt = data == null ? null : data.optJSONObject("popularTitles");
+            return pt == null ? null : pt.optJSONArray("edges");
+        } finally {
+            c.disconnect();
+        }
+    }
+
+    private boolean justWatchPopular(String kind, Set<String> watched, List<Pick> appOut, List<Pick> stremioOut) {
+        try {
+            JSONObject vars = new JSONObject()
+                    .put("country", justWatchCountry())
+                    .put("language", justWatchLanguage())
+                    .put("types", new JSONArray().put("movie".equals(kind) ? "MOVIE" : "SHOW"));
+            JSONArray edges = justWatchEdges(JW_POPULAR_QUERY, vars);
+            if (edges == null || edges.length() == 0) return false;
+            for (int i = 0; i < edges.length() && (appOut.size() < 24 || stremioOut.size() < 16); i++) {
+                JSONObject edge = edges.optJSONObject(i);
+                JSONObject node = edge == null ? null : edge.optJSONObject("node");
+                if (node == null) continue;
+                JwMatch jw = parseJwNode(node, null);
+                if (jw == null || jw.title == null || jw.title.isEmpty()) continue;
+                if (Prefs.hideAnimation() && jw.animated) continue;
+                int imdbNum = imdbNumericId(jw.imdb);
+                int id = jw.tmdbId > 0 ? jw.tmdbId : imdbNum;
+                if (id <= 0) continue;
+                if (watched.contains(kind + ":" + id) || (imdbNum > 0 && watched.contains(kind + ":" + imdbNum))) continue;
+                String bg = jw.backdrop;
+                if ((bg == null || bg.isEmpty()) && jw.imdb != null && jw.imdb.startsWith("tt")) {
+                    bg = "https://images.metahub.space/background/medium/" + jw.imdb + "/img";
+                }
+                if (bg == null || bg.isEmpty()) continue;
+
+                Pick p = new Pick();
+                p.id = id;
+                p.kind = kind;
+                p.title = jw.title;
+                p.backdrop = bg;
+                p.poster = jw.poster;
+                if (jw.app != null && jw.pkg != null) {
+                    p.app = jw.app;
+                    p.pkg = jw.pkg;
+                    p.link = jw.link;
+                } else if (!assignStremio(p, jw.imdb)) {
+                    continue;
+                }
+
+                List<String> parts = new ArrayList<>();
+                if ("tv".equals(kind)) parts.add(Ui.tr("Series"));
+                if (jw.genre != null && !jw.genre.isEmpty()) parts.add(jw.genre);
+                if (jw.duration != null && !jw.duration.isEmpty()) parts.add(jw.duration);
+                parts.add(name(p.app));
+                p.meta = String.join(" · ", parts);
+                p.detailed = true;
+
+                if ("stremio".equals(p.app)) {
+                    if (stremioOut.size() < 16) stremioOut.add(p);
+                } else if (appOut.size() < 24) {
+                    appOut.add(p);
+                }
+            }
+            return !appOut.isEmpty() || !stremioOut.isEmpty();
+        } catch (Exception e) {
+            AppLog.w("justwatch popular (" + kind + "): " + e.getMessage());
+            return false;
+        }
+    }
+
+    private JwMatch justWatchLookup(String kind, String title, String origTitle, String imdb, int tmdbId, String preferServiceKey) {
+        String primary = title == null ? "" : title.trim();
+        String alternate = origTitle == null ? "" : origTitle.trim();
+        String query = alternate.isEmpty() ? primary : alternate;
+        if (query.isEmpty()) return null;
+
+        long stamp = sourceStamp();
+        long now = System.currentTimeMillis();
+        String cacheKey = kind + "|" + tmdbId + "|" + (imdb == null ? "" : imdb) + "|" + plain(query)
+                + "|" + normalizeServiceName(preferServiceKey);
+        synchronized (jwCache) {
+            if (jwCacheStamp != stamp || now - jwCacheAt > LIST_EVERY || now < jwCacheAt) {
+                jwCache.clear();
+                jwCacheStamp = stamp;
+                jwCacheAt = now;
+            }
+            JwMatch cached = jwCache.get(cacheKey);
+            if (cached != null) return cached;
+        }
+
+        JwMatch result = new JwMatch();
+        try {
+            List<String> queries = new ArrayList<>();
+            queries.add(query);
+            if (!primary.isEmpty() && !primary.equalsIgnoreCase(query)) queries.add(primary);
+            for (String q : queries) {
+                JSONObject vars = new JSONObject()
+                        .put("country", justWatchCountry())
+                        .put("language", justWatchLanguage())
+                        .put("types", new JSONArray().put("movie".equals(kind) ? "MOVIE" : "SHOW"))
+                        .put("query", q);
+                JSONArray edges = justWatchEdges(JW_SEARCH_QUERY, vars);
+                if (edges == null) continue;
+                for (int i = 0; i < edges.length(); i++) {
+                    JSONObject edge = edges.optJSONObject(i);
+                    JSONObject node = edge == null ? null : edge.optJSONObject("node");
+                    if (!matchJwNode(node, kind, primary, alternate, imdb, tmdbId)) continue;
+                    result = parseJwNode(node, preferServiceKey);
+                    result.matched = true;
+                    break;
+                }
+                if (result.matched) break;
+            }
+        } catch (Exception e) {
+            AppLog.w("justwatch lookup (" + query + "): " + e.getMessage());
+            return null;   // transient error: don't cache negative lookup
+        }
+        synchronized (jwCache) {
+            if (jwCache.size() > 120) jwCache.clear();
+            jwCache.put(cacheKey, result);
+        }
+        return result;
+    }
+
+    private static boolean matchJwNode(JSONObject node, String kind, String title, String origTitle, String imdb, int tmdbId) {
+        if (node == null) return false;
+        String expectedType = "movie".equals(kind) ? "MOVIE" : "SHOW";
+        if (!expectedType.equals(node.optString("objectType"))) return false;
+        JSONObject content = node.optJSONObject("content");
+        if (content == null) return false;
+        JSONObject ext = content.optJSONObject("externalIds");
+        String extImdb = ext == null ? "" : ext.optString("imdbId", "").trim();
+        int extTmdb = ext == null ? 0 : parsePositiveInt(ext.optString("tmdbId", ""));
+        if (tmdbId > 0 && extTmdb > 0) return tmdbId == extTmdb;
+        boolean hasImdb = imdb != null && imdb.startsWith("tt");
+        boolean hasExtImdb = extImdb.startsWith("tt");
+        if (hasImdb && hasExtImdb) return imdb.equals(extImdb);
+
+        String pNodeTitle = plain(content.optString("title", ""));
+        String pNodeOrig = plain(content.optString("originalTitle", ""));
+        String pTitle = plain(title == null ? "" : title);
+        String pOrig = plain(origTitle == null ? "" : origTitle);
+        return (!pTitle.isEmpty() && (pTitle.equals(pNodeTitle) || pTitle.equals(pNodeOrig)))
+                || (!pOrig.isEmpty() && (pOrig.equals(pNodeTitle) || pOrig.equals(pNodeOrig)));
+    }
+
+    private JwMatch parseJwNode(JSONObject node, String preferServiceKey) {
+        JwMatch jw = new JwMatch();
+        JSONObject content = node.optJSONObject("content");
+        if (content == null) return jw;
+        jw.title = content.optString("title", content.optString("originalTitle", "")).trim();
+        JSONObject ext = content.optJSONObject("externalIds");
+        if (ext != null) {
+            jw.imdb = ext.optString("imdbId", "").trim();
+            jw.tmdbId = parsePositiveInt(ext.optString("tmdbId", ""));
+        }
+        JSONArray backdrops = content.optJSONArray("backdrops");
+        if (backdrops != null && backdrops.length() > 0) {
+            JSONObject b = backdrops.optJSONObject(0);
+            String bUrl = b == null ? "" : b.optString("backdropUrl", "");
+            if (!bUrl.isEmpty()) {
+                jw.backdrop = "https://images.justwatch.com" + bUrl.replace("{profile}", "s1920").replace("{format}", "jpg");
+            }
+        }
+        if (jw.imdb != null && jw.imdb.startsWith("tt")) {
+            jw.poster = "https://images.metahub.space/poster/medium/" + jw.imdb + "/img";
+        }
+        JSONArray genres = content.optJSONArray("genres");
+        for (int i = 0; genres != null && i < genres.length(); i++) {
+            JSONObject g = genres.optJSONObject(i);
+            if (g == null) continue;
+            if ("ani".equals(g.optString("shortName"))) jw.animated = true;
+            if (jw.genre == null || jw.genre.isEmpty()) jw.genre = genre(g.optString("translation", ""));
+        }
+        int mins = content.optInt("runtime", 0);
+        if (mins > 0) jw.duration = runtime(mins);
+
+        String wantPref = normalizeServiceName(preferServiceKey);
+        if ("stremio".equals(wantPref)) wantPref = "";
+        JSONArray offers = node.optJSONArray("offers");
+        String firstApp = null, firstPkg = null, firstLink = null;
+        String prefApp = null, prefPkg = null, prefLink = null;
+        for (int i = 0; offers != null && i < offers.length(); i++) {
+            JSONObject o = offers.optJSONObject(i);
+            if (o == null || !"FLATRATE".equals(o.optString("monetizationType"))) continue;
+            JSONObject pkgObj = o.optJSONObject("package");
+            if (pkgObj == null) continue;
+            String[] s = service(pkgObj.optString("clearName", ""), pkgObj.optInt("packageId", 0));
+            if (s == null || !installed(s[2])) continue;
+            String link = validProviderLink(s[1], o.optString("standardWebURL", ""));
+            if (firstApp == null) {
+                firstApp = s[1];
+                firstPkg = s[2];
+                firstLink = link;
+            } else if (firstApp.equals(s[1]) && firstLink == null && link != null) {
+                firstLink = link;
+            }
+            if (!wantPref.isEmpty() && (s[1].equals(wantPref) || s[0].equals(wantPref))) {
+                if (prefApp == null) {
+                    prefApp = s[1];
+                    prefPkg = s[2];
+                    prefLink = link;
+                } else if (prefApp.equals(s[1]) && prefLink == null && link != null) {
+                    prefLink = link;
+                }
+            }
+        }
+        jw.app = prefApp != null ? prefApp : firstApp;
+        jw.pkg = prefPkg != null ? prefPkg : firstPkg;
+        jw.link = prefApp != null ? prefLink : firstLink;
+        return jw;
+    }
+
+    private static final String[][] PROVIDER_HOSTS = {
+        {"netflix", "netflix."},
+        {"prime", "primevideo.", "amazon."},
+        {"disney", "disneyplus."},
+        {"max", "max.com", "hbomax.com"},
+        {"paramount", "paramountplus."},
+        {"appletv", "tv.apple.com"},
+    };
+
+    private static String validProviderLink(String appKey, String rawUrl) {
+        if (rawUrl == null || !rawUrl.startsWith("https://")) return null;
+        String clean = rawUrl.replace("&amp;", "&").trim();
+        if (clean.contains("justwatch.com")) return null;
+        try {
+            URL u = new URL(clean);
+            String host = u.getHost() == null ? "" : u.getHost().toLowerCase(Locale.ROOT);
+            String path = u.getPath() == null ? "" : u.getPath();
+            if (host.isEmpty() || path.length() <= 1) return null;
+            for (String[] row : PROVIDER_HOSTS) {
+                if (!row[0].equals(appKey)) continue;
+                for (int i = 1; i < row.length; i++) if (host.contains(row[i])) return clean;
+                return null;
+            }
+            return clean;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private static int parsePositiveInt(String s) {
+        if (s == null || s.isEmpty()) return 0;
+        try {
+            int v = Integer.parseInt(s.trim());
+            return Math.max(0, v);
+        } catch (NumberFormatException e) {
+            return 0;
+        }
+    }
+
+    private static int imdbNumericId(String imdb) {
+        if (imdb == null || !imdb.matches("tt\\d+")) return 0;
+        return parsePositiveInt(imdb.substring(2));
+    }
+
     /** The date `offset` days from today, as "2026-10-19" (negative = in the past). */
     private static String day(int offset) {
         Calendar cal = Calendar.getInstance();
@@ -984,15 +1694,12 @@ final class Recs {
             }
         }
         if (p.app != null) parts.add(name(p.app));
-        if (p.tag != null) parts.add(0, p.tag);
         JSONObject ext = o.optJSONObject("external_ids");
         String imdb = ext == null ? "" : ext.optString("imdb_id", "");
-        if (p.app != null && stremio() && imdb.startsWith("tt")) {     // the meta still names the TV's app it's on
-            p.servicePkg = p.pkg;   // its switch in Picks from (and the app itself) still decide whether it shows
-            p.app = "stremio";
-            p.pkg = STREMIO;
-            p.link = "stremio:///detail/" + (p.kind.equals("movie") ? "movie" : "series") + "/" + imdb;
-        }
+        // User preference: if it's on an installed streaming app (p.app != null), open it in that app;
+        // if it's NOT on any installed streaming app (p.app == null), open it in Stremio!
+        if (p.app == null && assignStremio(p, imdb)) parts.add("Stremio");
+        if (p.tag != null) parts.add(0, p.tag);
         p.meta = String.join(" · ", parts);
         p.detailed = true;
     }
@@ -1052,21 +1759,45 @@ final class Recs {
         return best;
     }
 
-    /** The SERVICES row for a TMDB name: the installed one first, when a service has more than one package. */
+    private static final String[][] SERVICE_ALIASES = {
+        {"hbo", "max"}, {"hbomax", "max"}, {"hbo max", "max"},
+        {"appletv", "apple tv"}, {"appletv+", "apple tv"}, {"apple tv+", "apple tv"},
+        {"disney+", "disney"}, {"disneyplus", "disney"}, {"disney plus", "disney"},
+        {"paramount+", "paramount"}, {"paramountplus", "paramount"}, {"paramount plus", "paramount"},
+        {"prime", "prime video"}, {"primevideo", "prime video"}, {"amazon", "prime video"}, {"amazon prime", "prime video"},
+    };
+
+    /** Normalizes provider/AI names so "hbo", "disney+", "paramount+", "appletv", etc. match SERVICES rows. */
+    private static String normalizeServiceName(String name) {
+        if (name == null) return "";
+        String n = name.trim().toLowerCase(Locale.ROOT).replace('_', ' ');
+        for (String[] alias : SERVICE_ALIASES) if (alias[0].equals(n)) return alias[1];
+        return n;
+    }
+
+    /** The SERVICES row for a TMDB/JustWatch/AI service name: installed one first, when a service has multiple packages. */
     private String[] service(String name, int providerId) {
-        String n = name.toLowerCase(Locale.ROOT);
+        String n = normalizeServiceName(name);
+        if (n.isEmpty()) return null;
         String[] first = null;
-        // "HBO Max Amazon Channel", "Apple TV Amazon Channel"...: a subscription sold inside another app, not this one.
-        if (n.contains(" channel")) return null;
+        // "HBO Max Amazon Channel", "Apple TV Amazon Channel", "Paramount+ (Via Amazon Prime)", "Apple TV Store"...
+        if (n.contains(" channel") || n.contains("(via") || n.contains(" store")) return null;
         for (String[] s : SERVICES) {
-            // Apple TV: only the streaming service (TMDB provider 350); provider 2 is the Apple TV Store (rent or buy).
-            if (s[1].equals("appletv") && providerId != 350) continue;
-            if (!(s[0].equals("max") ? n.matches(".*\\bmax\\b.*") : WHOLE_NAME.contains(s[0]) ? n.equals(s[0]) : n.contains(s[0]))) continue;
+            // Apple TV: only the streaming service (provider 350); provider 2 is the Apple TV Store (rent or buy).
+            if (s[1].equals("appletv") && providerId > 0 && providerId != 350) continue;
+            if (!(s[1].equals(n) || (s[0].equals("max") ? n.matches(".*\\bmax\\b.*")
+                    : WHOLE_NAME.contains(s[0]) ? n.equals(s[0]) : n.contains(s[0])))) continue;
             if (installed(s[2])) return s;
             if (first == null) first = s;
         }
-        if (first == null) for (String[] s : byName) if (s[0].equals(plain(name))) return s;
+        if (first == null) for (String[] s : byName) if (s[0].equals(plain(n))) return s;
         return first;
+    }
+
+    private boolean hasInstalledService() {
+        for (String[] s : SERVICES) if (installed(s[2])) return true;
+        for (String[] s : byName) if (installed(s[2])) return true;
+        return false;
     }
 
     /** The streaming services whose app is on this TV, as {key, name}, for Home Settings (Picks from). */
@@ -1292,20 +2023,24 @@ final class Recs {
         File f = imageFile(p);
         if (!f.exists()) fetchFile(f, p.id < 0
                 ? plexOpen("/photo/:/transcode?width=1920&height=1080&minSize=1&url=" + URLEncoder.encode(p.backdrop, "UTF-8"))
-                : (HttpURLConnection) new URL(IMAGES + p.backdrop).openConnection());
+                : (HttpURLConnection) new URL(p.backdrop.startsWith("http") ? p.backdrop : IMAGES + p.backdrop).openConnection());
         File poster = posterFile(p);
         if (poster == null || poster.exists()) return;
         try {   // the narrow cards: without a poster they crop the backdrop
             fetchFile(poster, p.id < 0
                     ? plexOpen("/photo/:/transcode?width=500&height=750&minSize=1&url=" + URLEncoder.encode(p.poster, "UTF-8"))
-                    : (HttpURLConnection) new URL(POSTERS + p.poster).openConnection());
+                    : (HttpURLConnection) new URL(p.poster.startsWith("http") ? p.poster : POSTERS + p.poster).openConnection());
         } catch (IOException e) {
             AppLog.w("poster: " + e.getMessage());
         }
     }
 
     private File posterFile(Pick p) {
-        return p.poster == null || p.poster.isEmpty() ? null : new File(new File(context.getCacheDir(), "recs"), "p" + p.poster.replace("/", ""));
+        if (p.poster == null || p.poster.isEmpty()) return null;
+        String name = p.poster.startsWith("http")
+                ? "p_" + Integer.toHexString(p.poster.hashCode()) + ".jpg"
+                : "p" + p.poster.replace("/", "");
+        return new File(new File(context.getCacheDir(), "recs"), name);
     }
 
     private void fetchFile(File f, HttpURLConnection c) throws IOException {
@@ -1385,6 +2120,54 @@ final class Recs {
         synchronized (images) {
             return p == null || p.backdrop == null ? null : posters.get(p.backdrop);
         }
+    }
+
+    /** Thumbnail cropped to targetW x targetH for the voice assistant cards, reusing disk cache. */
+    Bitmap cardThumb(Pick p, int targetW, int targetH) {
+        if (p == null || p.photo != null) return null;
+        File poster = posterFile(p);
+        File bg = imageFile(p);
+        if ((poster == null || !poster.exists()) && !bg.exists() && p.backdrop != null) {
+            try {
+                download(p);
+            } catch (IOException ignored) {}
+            poster = posterFile(p);
+        }
+        Bitmap b = decodeCardFile(poster, targetW, targetH, 0f);
+        if (b != null) return b;
+        if (!bg.exists() && p.backdrop != null) {
+            try {
+                download(p);
+            } catch (IOException ignored) {}
+        }
+        return decodeCardFile(bg, targetW, targetH, 0.35f);
+    }
+
+    private static Bitmap decodeCardFile(File f, int targetW, int targetH, float topCut) {
+        if (f == null || !f.exists()) return null;
+        BitmapFactory.Options bounds = new BitmapFactory.Options();
+        bounds.inJustDecodeBounds = true;
+        BitmapFactory.decodeFile(f.getPath(), bounds);
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
+            //noinspection ResultOfMethodCallIgnored
+            f.delete();
+            return null;
+        }
+        BitmapFactory.Options opts = new BitmapFactory.Options();
+        opts.inSampleSize = 1;
+        while (bounds.outWidth / (opts.inSampleSize * 2) >= targetW
+                && bounds.outHeight / (opts.inSampleSize * 2) >= targetH) {
+            opts.inSampleSize *= 2;
+        }
+        Bitmap decoded = BitmapFactory.decodeFile(f.getPath(), opts);
+        if (decoded == null) {
+            //noinspection ResultOfMethodCallIgnored
+            f.delete();
+            return null;
+        }
+        Bitmap cropped = Backdrop.card(decoded, targetW, targetH, topCut);
+        if (cropped != decoded && !decoded.isRecycled()) decoded.recycle();
+        return cropped;
     }
 
     void trim() {

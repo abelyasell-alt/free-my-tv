@@ -393,7 +393,6 @@
  "services|Some": "Some",
  "shelf|Off": "Off",
  "talkback|Sunrise {time}": "Sunrise {time}",
- "the TV asked for TLS (wireless debugging); use USB debugging": "the TV asked for TLS (wireless debugging); use USB debugging",
  "the TV rejected the app's key": "the TV rejected the app's key",
  "the TV's ADB didn't respond": "the TV's ADB didn't respond",
  "the TV's factory home screen": "the TV's factory home screen",

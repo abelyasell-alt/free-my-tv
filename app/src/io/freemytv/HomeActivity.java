@@ -19,6 +19,8 @@ import android.widget.TextView;
 public class HomeActivity extends Activity {
     /** Opens All Apps (a remote's All Apps button, RemoteKeys). */
     static final String EXTRA_ALL_APPS = "io.freemytv.ALL_APPS";
+    /** Opens a specific Home recommendations tab (0 = Explore, 1 = Movies, 2 = Shows). */
+    static final String EXTRA_TAB = "io.freemytv.TAB";
     private HomeView home;
     private int prefsVersion = Prefs.version;   // settings changed while we were away: start over
 
@@ -44,6 +46,7 @@ public class HomeActivity extends Activity {
         setContentView(home);
         getWindow().setBackgroundDrawable(null);
         if (getIntent().getBooleanExtra(EXTRA_ALL_APPS, false)) home.showAllApps();
+        else if (getIntent().hasExtra(EXTRA_TAB)) home.showTab(getIntent().getIntExtra(EXTRA_TAB, 0));
         // At power-on "Live TV" (#346): the first time the home screen comes up after a full start, in Free My TV mode.
         if (HomeMode.noteHomeShown(this) && SystemClock.elapsedRealtime() < 240_000 && "live".equals(Prefs.powerOn())) {
             org.json.JSONObject s = HomeMode.state(this);
@@ -74,6 +77,7 @@ public class HomeActivity extends Activity {
             return;
         }
         if (home != null) home.resume();
+        HomeMode.checkCastOnUpdate(this);
         Updates.tellOnce(this);   // an update the week's check got ready: said once
     }
 
@@ -89,6 +93,10 @@ public class HomeActivity extends Activity {
         if (home == null) return;
         if (intent.getBooleanExtra(EXTRA_ALL_APPS, false)) {
             home.showAllApps();
+            return;
+        }
+        if (intent.hasExtra(EXTRA_TAB)) {
+            home.showTab(intent.getIntExtra(EXTRA_TAB, 0));
             return;
         }
         long now = SystemClock.uptimeMillis();

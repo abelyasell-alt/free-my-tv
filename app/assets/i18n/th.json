@@ -393,7 +393,6 @@
  "services|Some": "บางส่วน",
  "shelf|Off": "ปิด",
  "talkback|Sunrise {time}": "พระอาทิตย์ขึ้น {time}",
- "the TV asked for TLS (wireless debugging); use USB debugging": "ทีวีขอ TLS (การแก้ไขข้อบกพร่องไร้สาย) ให้ใช้การแก้ไขข้อบกพร่องผ่าน USB",
  "the TV rejected the app's key": "ทีวีปฏิเสธคีย์ของแอป",
  "the TV's ADB didn't respond": "ADB ของทีวีไม่ตอบสนอง",
  "the TV's factory home screen": "หน้าหลักเดิมของทีวี",

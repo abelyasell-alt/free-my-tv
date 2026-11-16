@@ -393,7 +393,6 @@
  "services|Some": "Деякі",
  "shelf|Off": "Вимк.",
  "talkback|Sunrise {time}": "Схід {time}",
- "the TV asked for TLS (wireless debugging); use USB debugging": "телевізор запросив TLS (бездротове налагодження); використовуйте налагодження через USB",
  "the TV rejected the app's key": "телевізор відхилив ключ застосунку",
  "the TV's ADB didn't respond": "ADB телевізора не відповів",
  "the TV's factory home screen": "заводський головний екран телевізора",

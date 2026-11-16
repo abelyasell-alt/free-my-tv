@@ -393,7 +393,6 @@
  "services|Some": "Alcuni",
  "shelf|Off": "Disattivo",
  "talkback|Sunrise {time}": "Alba {time}",
- "the TV asked for TLS (wireless debugging); use USB debugging": "la TV ha chiesto TLS (debug wireless); usa il debug USB",
  "the TV rejected the app's key": "la TV ha rifiutato la chiave dell'app",
  "the TV's ADB didn't respond": "l'ADB della TV non ha risposto",
  "the TV's factory home screen": "la Home originale della TV",

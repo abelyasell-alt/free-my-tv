@@ -788,6 +788,25 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
         motionDirty = true;
     }
 
+    /** Switches directly to Explore (0), Movies (1), or Shows (2) and focuses its recommendation row. */
+    void showTab(int index) {
+        wake();
+        cancelReorder(true);
+        closeMenu(true);
+        if (recents != null) recents.close();
+        sheetOpen = false;
+        drawerOpen = false;
+        sheet.snap(0);
+        drawer.snap(0);
+        int safe = Math.max(0, Math.min(2, index));
+        selectTab(safe);
+        zone = !picks.isEmpty() ? Z_CARDS : (picksOn() ? Z_TOP : Z_SHELF);
+        topIndex = safe;
+        cardIndex = 0;
+        retarget(true);
+        motionDirty = true;
+    }
+
     /** The round buttons at the top right (Settings > Top Buttons), with their names in the current language. */
     private void setLightButtons(List<HomeApps.Item> list) {
         if (reorderTop) cancelReorder(true);
@@ -3050,6 +3069,11 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
                     okDown = okHeld = false;
                 }
                 return true;
+            case KeyEvent.KEYCODE_ASSIST:
+            case KeyEvent.KEYCODE_VOICE_ASSIST:
+            case KeyEvent.KEYCODE_SEARCH:
+                if (down && e.getRepeatCount() == 0) GeminiAi.openVoice(activity, this);
+                return true;
             case KeyEvent.KEYCODE_SETTINGS:
             case KeyEvent.KEYCODE_NOTIFICATION:
                 // The remote's Settings button opens TV Settings; ours stay on the gear on screen. TCL's and Hisense's
@@ -3289,6 +3313,10 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
             r = tileRects[shelfIndex];
         }
         click.open();
+        if (it.kind == HomeApps.GEMINI) {
+            GeminiAi.openVoice(activity, this);
+            return;
+        }
         if (it.kind == HomeApps.RECENTS) {
             openRecents();
             return;

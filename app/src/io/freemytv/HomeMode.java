@@ -99,6 +99,8 @@ final class HomeMode {
      * (Android 9) has the same setup app without a home screen: there it is left alone.
      */
     static final String GOOGLE_SETUP = "com.google.android.tungsten.setupwraith";
+    static final String CAST_RECEIVER = "com.google.android.apps.mediashell";
+    private static volatile long castSeenUpdate;
     /**
      * Some HY300 projectors (Amlogic txhd2, Android 13) answer the Home button with JmLauncher, not the default home:
      * it opens the package in JM_HOME, else the HTC home screen, and with that one off and the property empty, a black
@@ -532,6 +534,7 @@ final class HomeMode {
             return;
         }
         try (Adb adb = connect(c, s)) {
+            grantSelfAccess(c, adb);
             // The TV's own home screen and screensaver, recorded once (before ours replace them) so "original" restores
             // exactly what was there, on any brand.
             String home = originalHome(s);
@@ -643,6 +646,8 @@ final class HomeMode {
                 }
             }
             wakeWatch(adb, true);
+            warmCast(c, adb, s);
+            voiceAssistant(c, adb, GeminiAi.hasKey(c));
             notice(c, Ui.trf("Free My TV is on: new home screen and screensaver, {n} apps turned off.", "n", disabled.size()));
             busy(c, Ui.tr("Measuring Free My TV…"));
             measure(c, adb, FREE, false);
@@ -661,6 +666,7 @@ final class HomeMode {
     private static void applyOriginal(Context c) {
         JSONObject s = state(c);
         try (Adb adb = connect(c, s)) {
+            grantSelfAccess(c, adb);
             busy(c, Ui.tr("Turning the apps back on…"));
             String home = originalHome(s);
             Set<String> toEnable = new HashSet<>(stringList(s, "disabled"));
@@ -703,6 +709,7 @@ final class HomeMode {
                 AppLog.w("remote buttons service: " + e.getMessage());
             }
             wakeWatch(adb, false);
+            voiceAssistant(c, adb, false);
             SleepTimer.stop(c);
             adb.shell("appops set " + PKG + " SYSTEM_ALERT_WINDOW default");   // SleepOverlay's, if it was allowed
             Capabilities.forget(c, Capabilities.OVERLAY);                       // asked again next time
@@ -839,6 +846,10 @@ final class HomeMode {
      * things back on) and after an update of this app.
      */
     static void verifyNow(Context app) {
+        verifyNow(app, "");
+    }
+
+    static void verifyNow(Context app, String mode) {
         synchronized (RUN) {
             JSONObject s = state(app);
             String fingerprint = Build.FINGERPRINT;
@@ -858,6 +869,7 @@ final class HomeMode {
             }
             List<String> fixed = new ArrayList<>();
             try (Adb adb = Adb.connect(app, 10_000, null)) {
+                grantSelfAccess(app, adb);
                 try {   // as the widget says: a TV update can take it back, and a take-back can have failed
                     nowPlaying(app, adb, !s.optBoolean("homeReverted") && nowPlayingOn());
                 } catch (IOException e) {
@@ -988,7 +1000,9 @@ final class HomeMode {
                 latest.put("disabled", new JSONArray(sorted(disabled)));
                 if (theirs) latest.put("keptOff", new JSONArray(keptOff));
                 save(app, latest);
+                if (!reverted) warmCast(app, adb, latest);
             } catch (Exception e) {
+                if (scheduleVerifyRetryIfNeeded(app, mode, e)) return;
                 notice(app, Ui.trf("Couldn't check Free My TV: {error}", "error", e.getMessage()));
                 return;
             }
@@ -999,6 +1013,343 @@ final class HomeMode {
                 notice(app, Ui.tr("The TV was updated; Free My TV is still on."));
             }
         }
+    }
+
+    /** If Play Store silently updated Google Cast receiver in the background while Free My TV is on, re-warm Cast. */
+    static void checkCastOnUpdate(Context c) {
+        if (AMAZON || BRICKS) return;
+        JSONObject s = state(c);
+        if (!FREE.equals(s.optString("mode")) || s.optBoolean("homeReverted")) return;
+        long warmed = s.optLong("castWarmedUpdate", 0L);
+        if (warmed <= 0L) return;
+        long current = packageUpdateTime(c, CAST_RECEIVER);
+        if (current <= 0L || current == warmed || current == castSeenUpdate) return;
+        castSeenUpdate = current;
+        verify(c);
+    }
+
+    private static boolean scheduleVerifyRetryIfNeeded(Context app, String mode, Exception error) {
+        if (!(error instanceof IOException) || Build.VERSION.SDK_INT < 30) return false;
+        String nextRetry;
+        if (mode == null || mode.isEmpty()) nextRetry = "retry1";
+        else if ("retry1".equals(mode)) nextRetry = "retry2";
+        else return false;
+
+        boolean hasNet = hasUpNetworkInterface();
+        boolean canAutoWifiAdb = app.checkSelfPermission("android.permission.WRITE_SECURE_SETTINGS")
+                == android.content.pm.PackageManager.PERMISSION_GRANTED
+                || android.provider.Settings.Global.getInt(app.getContentResolver(), "adb_wifi_enabled", 0) == 1;
+        if (hasNet && !canAutoWifiAdb) return false;
+
+        AppLog.w("deferring verify (" + nextRetry + ") until network/ADB settles: " + error.getMessage());
+        ModeJob.schedule(app, ModeJob.VERIFY, nextRetry, 10_000L, true);
+        return true;
+    }
+
+    private static boolean hasUpNetworkInterface() {
+        try {
+            java.util.Enumeration<java.net.NetworkInterface> nifs = java.net.NetworkInterface.getNetworkInterfaces();
+            while (nifs != null && nifs.hasMoreElements()) {
+                java.net.NetworkInterface ni = nifs.nextElement();
+                if (!ni.isLoopback() && ni.isUp() && ni.getInetAddresses().hasMoreElements()) return true;
+            }
+        } catch (IOException | RuntimeException ignored) {}
+        return false;
+    }
+
+    private static void grantSelfAccess(Context c, Adb adb) {
+        try {
+            if (Build.VERSION.SDK_INT >= 30 && c.checkSelfPermission("android.permission.WRITE_SECURE_SETTINGS")
+                    != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                adb.shell("pm grant " + PKG + " android.permission.WRITE_SECURE_SETTINGS");
+            }
+            if (c.checkSelfPermission("android.permission.RECORD_AUDIO")
+                    != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                adb.shell("pm grant " + PKG + " android.permission.RECORD_AUDIO");
+            }
+            // Prevent authorized Wireless Debugging keys from expiring after 7 days in standby if unset.
+            String authTimeout = adb.shell("settings get global adb_allowed_connection_time").trim();
+            if (authTimeout.isEmpty() || "null".equals(authTimeout)) {
+                adb.shell("settings put global adb_allowed_connection_time 0");
+            }
+        } catch (Exception e) {
+            AppLog.w("self access setup: " + e.getMessage());
+        }
+    }
+
+    /** Switches Android's Digital Assistant role to Free My TV while on, and restores the TV's original assistant on exit. */
+    private static void voiceAssistant(Context c, Adb adb, boolean on) {
+        try {
+            if (on) {
+                JSONObject s = state(c);
+                String prev = s.optString("originalAssistant", "");
+                if (prev.isEmpty()) {
+                    String current = adb.shell("cmd role get-role-holders --user 0 android.app.role.ASSISTANT").trim();
+                    if (current.matches("[\\w.]+") && !current.equals(PKG)) {
+                        s.put("originalAssistant", current);
+                        save(c, s);
+                    }
+                }
+                adb.shell("cmd role add-role-holder --user 0 android.app.role.ASSISTANT " + PKG);
+                String active = adb.shell("cmd role get-role-holders --user 0 android.app.role.ASSISTANT").trim();
+                if (!active.contains(PKG)) {
+                    String svc = PKG + "/.VoiceAssistantService";
+                    adb.shell("settings put secure assistant " + svc);
+                    adb.shell("settings put secure voice_interaction_service " + svc);
+                }
+            } else {
+                JSONObject s = state(c);
+                String prev = s.optString("originalAssistant", "");
+                String current = adb.shell("cmd role get-role-holders --user 0 android.app.role.ASSISTANT").trim();
+                if (current.contains(PKG)) {
+                    if (prev.matches("[\\w.]+")) {
+                        adb.shell("cmd role add-role-holder --user 0 android.app.role.ASSISTANT " + prev);
+                    } else {
+                        adb.shell("cmd role remove-role-holder --user 0 android.app.role.ASSISTANT " + PKG);
+                    }
+                }
+                String curSetting = adb.shell("settings get secure assistant").trim();
+                if (curSetting.startsWith(PKG + "/")) {
+                    adb.shell("settings delete secure assistant");
+                    adb.shell("settings delete secure voice_interaction_service");
+                }
+            }
+        } catch (Exception e) {
+            AppLog.w("voice assistant role: " + e.getMessage());
+        }
+    }
+
+    /**
+     * On Google TV devices where setupwraith hosts CastInfoProvider, disabling setupwraith prevents mediashell from
+     * loading factory Cast credentials on startup or after an update. Temporarily enables TV home, then setupwraith,
+     * lets mediashell cache its credentials into memory, and ALWAYS disables setupwraith before re-disabling TV home.
+     */
+    private static void warmCast(Context c, Adb adb, JSONObject s) {
+        if (!FREE.equals(s.optString("mode")) || s.optBoolean("homeReverted")) return;
+        try {
+            long castUpdateTime = packageUpdateTime(c, CAST_RECEIVER);
+            if (castUpdateTime < 0 && adb.shell("pm path " + CAST_RECEIVER).trim().isEmpty()) return;
+
+            java.util.Set<String> disabled = listDisabledPackages(adb);
+            if (!disabled.contains(GOOGLE_SETUP)) {
+                if (castUpdateTime > 0 && castUpdateTime != s.optLong("castWarmedUpdate", -1L)) {
+                    s.put("castWarmedUpdate", castUpdateTime);
+                    save(c, s);
+                }
+                return;
+            }
+
+            boolean hasProvider;
+            if (s.has("castInfoProvider")) {
+                hasProvider = s.optBoolean("castInfoProvider");
+            } else {
+                hasProvider = adb.shell("dumpsys package " + GOOGLE_SETUP).contains("CastInfoProvider");
+                s.put("castInfoProvider", hasProvider);
+                save(c, s);
+            }
+            if (!hasProvider) {
+                if (castUpdateTime > 0 && castUpdateTime != s.optLong("castWarmedUpdate", -1L)) {
+                    s.put("castWarmedUpdate", castUpdateTime);
+                    save(c, s);
+                }
+                return;
+            }
+
+            String proc = mediashellProcToken(adb);
+            String currentPid = splitPid(proc)[0];
+            boolean sameProc = !proc.isEmpty() && proc.equals(s.optString("castWarmedProc"));
+            boolean sameVer = castUpdateTime <= 0 || castUpdateTime == s.optLong("castWarmedUpdate", -1L);
+            if (sameProc && sameVer && !mediashellNeedsProvisioning(adb, currentPid)) {
+                return;
+            }
+
+            java.util.Set<String> candidates = new java.util.LinkedHashSet<>();
+            candidates.add(pkgOf(GOOGLE_HOME));
+            candidates.add(TV_LAUNCHER);
+            candidates.add(pkgOf(originalHome(s)));
+            candidates.add(pkgOf(s.optString("setupHome")));
+            List<String> tvHomes = new ArrayList<>();
+            for (String p : candidates) {
+                if (!p.isEmpty() && !PKG.equals(p) && !GOOGLE_SETUP.equals(p) && disabled.contains(p)) {
+                    tvHomes.add(p);
+                }
+            }
+
+            // CRITICAL INVARIANT: enable every disabled TV home package BEFORE enabling setupwraith.
+            for (String pkg : tvHomes) {
+                adb.shell("pm enable " + pkg);
+            }
+            java.util.Set<String> afterHomeEnable = listDisabledPackages(adb);
+            for (String pkg : tvHomes) {
+                if (afterHomeEnable.contains(pkg)) {
+                    AppLog.w("cast warmup aborted: failed to enable " + pkg);
+                    return;
+                }
+            }
+
+            try {
+                adb.shell("pm enable " + GOOGLE_SETUP);
+                if (listDisabledPackages(adb).contains(GOOGLE_SETUP)) {
+                    AppLog.w("cast warmup aborted: failed to enable " + GOOGLE_SETUP);
+                    return;
+                }
+
+                adb.shell("am force-stop " + CAST_RECEIVER);
+                String startOut = adb.shell("am startservice -n " + CAST_RECEIVER + "/.CastReceiverService");
+                if (startOut.contains("Error") || startOut.contains("not found") || startOut.contains("Unable")) {
+                    adb.shell("am startservice -a com.google.cast.action.BIND -p " + CAST_RECEIVER);
+                }
+
+                long deadline = android.os.SystemClock.elapsedRealtime() + 12_000L;
+                long firstCleanLoadMs = -1L;
+                boolean triedFallbackStart = false;
+                boolean provisioned = false;
+                String warmedProc = "";
+                while (android.os.SystemClock.elapsedRealtime() < deadline) {
+                    android.os.SystemClock.sleep(750L);
+                    String procNow = mediashellProcToken(adb);
+                    String pidNow = splitPid(procNow)[0];
+                    if (pidNow.isEmpty()) {
+                        if (!triedFallbackStart) {
+                            triedFallbackStart = true;
+                            adb.shell("am startservice -a com.google.cast.action.BIND -p " + CAST_RECEIVER);
+                        }
+                        firstCleanLoadMs = -1L;
+                        continue;
+                    }
+                    String logs = adb.shell("logcat -d --pid=" + pidNow);
+                    int lastLoad = logs.lastIndexOf("Loading factory credentials");
+                    if (lastLoad < 0) {
+                        firstCleanLoadMs = -1L;
+                        continue;
+                    }
+                    if (hasCastCredError(logs.substring(lastLoad))) {
+                        firstCleanLoadMs = -1L;
+                        continue;
+                    }
+                    long now = android.os.SystemClock.elapsedRealtime();
+                    if (firstCleanLoadMs < 0L) {
+                        firstCleanLoadMs = now;
+                    } else if (now - firstCleanLoadMs >= 1_500L) {
+                        provisioned = true;
+                        warmedProc = procNow;
+                        break;
+                    }
+                }
+
+                if (provisioned && !warmedProc.isEmpty()) {
+                    s.put("castWarmedProc", warmedProc);
+                    if (castUpdateTime > 0) s.put("castWarmedUpdate", castUpdateTime);
+                    save(c, s);
+                } else {
+                    AppLog.w("cast warmup did not confirm credentials within timeout");
+                }
+            } finally {
+                restoreAfterCastWarmup(c, adb, tvHomes);
+            }
+        } catch (Exception e) {
+            AppLog.w("cast warmup: " + e.getMessage());
+        }
+    }
+
+    private static void restoreAfterCastWarmup(Context c, Adb adb, List<String> tvHomes) {
+        Adb cleanupAdb = adb;
+        Adb fallbackAdb = null;
+        try {
+            try {
+                if (!"ok".equals(cleanupAdb.shell("echo ok").trim())) throw new IOException("stale adb");
+            } catch (Exception ignored) {
+                fallbackAdb = Adb.connect(c, 5_000, null);
+                cleanupAdb = fallbackAdb;
+            }
+            // CRITICAL INVARIANT: disable setupwraith FIRST and verify before disabling any TV home package.
+            cleanupAdb.shell("pm disable-user --user 0 " + GOOGLE_SETUP);
+            if (!listDisabledPackages(cleanupAdb).contains(GOOGLE_SETUP)) {
+                AppLog.w("cast warmup: setupwraith still enabled, keeping TV home enabled");
+                return;
+            }
+            for (String pkg : tvHomes) {
+                cleanupAdb.shell("pm disable-user --user 0 " + pkg);
+                cleanupAdb.shell("am force-stop " + pkg);
+            }
+            cleanupAdb.shell("cmd package set-home-activity " + HOME_ACTIVITY);
+        } catch (Exception e) {
+            AppLog.w("cast warmup restore failed: " + e.getMessage());
+        } finally {
+            if (fallbackAdb != null) fallbackAdb.close();
+        }
+    }
+
+    private static long packageUpdateTime(Context c, String pkg) {
+        try {
+            return c.getPackageManager().getPackageInfo(pkg, 0).lastUpdateTime;
+        } catch (Exception e) {
+            return -1L;
+        }
+    }
+
+    private static java.util.Set<String> listDisabledPackages(Adb adb) throws IOException {
+        java.util.Set<String> set = new java.util.HashSet<>();
+        for (String line : adb.shell("pm list packages -d").split("\n")) {
+            String t = line.trim();
+            if (t.startsWith("package:")) set.add(t.substring(8).trim());
+        }
+        return set;
+    }
+
+    private static String mediashellProcToken(Adb adb) throws IOException {
+        String pidOut = adb.shell("pidof " + CAST_RECEIVER).trim();
+        if (pidOut.isEmpty()) return "";
+        String pid = pidOut.split("\\s+")[0];
+        for (int i = 0; i < pid.length(); i++) {
+            if (!Character.isDigit(pid.charAt(i))) return "";
+        }
+        String stat = adb.shell("cat /proc/" + pid + "/stat");
+        return parseProcToken(pid, stat);
+    }
+
+    static String parseProcToken(String pid, String statLine) {
+        if (pid == null || pid.isEmpty() || statLine == null) return "";
+        int rparen = statLine.lastIndexOf(") ");
+        if (rparen < 0) return "";
+        String[] rest = statLine.substring(rparen + 2).trim().split("\\s+");
+        // Field 22 in /proc/<pid>/stat is starttime; after stripping fields 1 (pid) and 2 (comm), index 19 is field 22.
+        if (rest.length <= 19) return "";
+        return pid + " " + rest[19];
+    }
+
+    private static String[] splitPid(String procToken) {
+        if (procToken == null || procToken.isEmpty()) return new String[]{ "", "" };
+        int space = procToken.indexOf(' ');
+        if (space <= 0) return new String[]{ "", "" };
+        return new String[]{ procToken.substring(0, space), procToken.substring(space + 1) };
+    }
+
+    private static boolean mediashellNeedsProvisioning(Adb adb, String pid) throws IOException {
+        if (pid.isEmpty()) return true;
+        return needsProvisioningFromLog(adb.shell("logcat -d --pid=" + pid));
+    }
+
+    static boolean needsProvisioningFromLog(String logs) {
+        if (logs == null) return true;
+        int lastLoad = logs.lastIndexOf("Loading factory credentials");
+        String relevant = lastLoad >= 0 ? logs.substring(lastLoad) : logs;
+        return hasCastCredError(relevant);
+    }
+
+    static boolean hasCastCredError(String logs) {
+        if (logs == null) return false;
+        return logs.contains("Failed to find provider info")
+                || logs.contains("Cannot get device credentials")
+                || logs.contains("Retry loading factory credentials")
+                || logs.contains("ClientAuthSigner has not been initialized")
+                || logs.contains("Unable to prepare client certificate");
+    }
+
+    private static String pkgOf(String componentOrPkg) {
+        if (componentOrPkg == null) return "";
+        int slash = componentOrPkg.indexOf('/');
+        return (slash >= 0 ? componentOrPkg.substring(0, slash) : componentOrPkg).trim();
     }
 
     /**

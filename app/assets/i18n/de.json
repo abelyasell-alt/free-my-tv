@@ -393,7 +393,6 @@
  "services|Some": "Einige",
  "shelf|Off": "Aus",
  "talkback|Sunrise {time}": "Sonnenaufgang {time}",
- "the TV asked for TLS (wireless debugging); use USB debugging": "der Fernseher wollte TLS (kabelloses Debugging); USB-Debugging verwenden",
  "the TV rejected the app's key": "der Fernseher hat den Schlüssel der App abgelehnt",
  "the TV's ADB didn't respond": "das ADB des Fernsehers hat nicht geantwortet",
  "the TV's factory home screen": "der Startbildschirm ab Werk",

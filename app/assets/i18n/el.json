@@ -393,7 +393,6 @@
  "services|Some": "Ορισμένες",
  "shelf|Off": "Ανενεργό",
  "talkback|Sunrise {time}": "Ανατολή {time}",
- "the TV asked for TLS (wireless debugging); use USB debugging": "η τηλεόραση ζήτησε TLS (ασύρματος εντοπισμός σφαλμάτων)· χρησιμοποίησε εντοπισμό σφαλμάτων USB",
  "the TV rejected the app's key": "η τηλεόραση απέρριψε το κλειδί της εφαρμογής",
  "the TV's ADB didn't respond": "το ADB της τηλεόρασης δεν απάντησε",
  "the TV's factory home screen": "η εργοστασιακή αρχική οθόνη της TV",

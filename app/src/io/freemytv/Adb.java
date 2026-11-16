@@ -56,9 +56,16 @@ final class Adb implements Closeable {
         byte[] data;
     }
 
-    private final Socket socket;
-    private final DataInputStream in;
-    private final OutputStream out;
+    private static final int STLS_VERSION = 0x01000000;
+    /** DER AlgorithmIdentifier for sha256WithRSAEncryption (OID 1.2.840.113549.1.1.11 + NULL). */
+    private static final byte[] SHA256_RSA_ALG = {
+        0x30, 0x0d, 0x06, 0x09, 0x2a, (byte) 0x86, 0x48, (byte) 0x86, (byte) 0xf7, 0x0d, 0x01, 0x01, 0x0b, 0x05, 0x00
+    };
+
+    private Socket socket;
+    private DataInputStream in;
+    private OutputStream out;
+    private Context restoreWifiContext;
     private int nextLocalId = 1;
 
     private Adb(Socket socket) throws IOException {
@@ -70,19 +77,27 @@ final class Adb implements Closeable {
     /** Connects and authenticates. If the TV doesn't know our key yet, waits up to `approvalMs` for you to accept. */
     static Adb connect(Context c, int approvalMs, Approval approval) throws IOException {
         KeyPair keys = keys(c);
+        Context restoreWifiOnClose = null;
         Socket s = new Socket();
         try {
             s.connect(new InetSocketAddress("127.0.0.1", 5555), 3000);
         } catch (IOException e) {
             s.close();
-            throw new IOException(Ui.tr("debugging is off on the TV (port 5555 closed)"));
+            if (c == null || android.os.Build.VERSION.SDK_INT < 30) {
+                throw new IOException(Ui.tr("debugging is off on the TV (port 5555 closed)"));
+            }
+            TlsSocket tls = connectTlsSocket(c);
+            s = tls.socket;
+            restoreWifiOnClose = tls.restoreWifiContext;
         }
         Adb adb;
         try {
             s.setSoTimeout(10_000);
             adb = new Adb(s);
+            adb.restoreWifiContext = restoreWifiOnClose;
         } catch (IOException | RuntimeException e) {
-            s.close();
+            try { s.close(); } catch (IOException ignored) {}
+            if (restoreWifiOnClose != null) setWifiAdb(restoreWifiOnClose, false);
             throw e;
         }
         try {
@@ -93,14 +108,20 @@ final class Adb implements Closeable {
                 try {
                     m = adb.read();
                 } catch (EOFException | SocketTimeoutException e) {
+                    adb.close();
                     throw new IOException(offeredKey ? Ui.tr("debugging permission wasn't accepted on the TV") : Ui.tr("the TV's ADB didn't respond"));
                 }
                 if (m.command == CNXN) {
-                    s.setSoTimeout(20_000);
+                    adb.socket.setSoTimeout(20_000);
                     return adb;
                 }
-                if (m.command == STLS) throw new IOException(Ui.tr("the TV asked for TLS (wireless debugging); use USB debugging"));
-                if (m.command != AUTH || m.arg0 != AUTH_TOKEN) throw new IOException(Ui.tr("unexpected reply from ADB"));
+                if (m.command == STLS) {
+                    return adb.completeTlsHandshake(keys);
+                }
+                if (m.command != AUTH || m.arg0 != AUTH_TOKEN) {
+                    adb.close();
+                    throw new IOException(Ui.tr("unexpected reply from ADB"));
+                }
                 if (!signed) {
                     adb.send(AUTH, AUTH_SIGNATURE, 0, sign(keys.getPrivate(), m.data));
                     signed = true;
@@ -184,7 +205,324 @@ final class Adb implements Closeable {
     }
 
     @Override public void close() {
-        try { socket.close(); } catch (IOException ignored) {}
+        try {
+            socket.close();
+        } catch (IOException ignored) {
+        } finally {
+            Context c = restoreWifiContext;
+            restoreWifiContext = null;
+            if (c != null) setWifiAdb(c, false);
+        }
+    }
+
+    private Adb completeTlsHandshake(KeyPair keys) throws IOException {
+        try {
+            send(STLS, STLS_VERSION, 0, null);
+            out.flush();
+            javax.net.ssl.SSLSocketFactory sf = tlsSocketFactory(keys);
+            java.net.InetAddress addr = socket.getInetAddress();
+            String host = addr != null ? addr.getHostAddress() : "127.0.0.1";
+            javax.net.ssl.SSLSocket ssl = (javax.net.ssl.SSLSocket) sf.createSocket(socket, host, socket.getPort(), true);
+            ssl.setUseClientMode(true);
+            ssl.setSoTimeout(10_000);
+            ssl.startHandshake();
+            this.socket = ssl;
+            this.in = new DataInputStream(ssl.getInputStream());
+            this.out = ssl.getOutputStream();
+            Message m = read();
+            if (m.command != CNXN) throw new IOException(Ui.tr("unexpected reply from ADB"));
+            ssl.setSoTimeout(20_000);
+            return this;
+        } catch (javax.net.ssl.SSLException | EOFException e) {
+            close();
+            throw new IOException(Ui.tr("the TV rejected the app's key"), e);
+        } catch (SocketTimeoutException e) {
+            close();
+            throw new IOException(Ui.tr("the TV's ADB didn't respond"), e);
+        } catch (IOException | RuntimeException e) {
+            close();
+            throw e;
+        }
+    }
+
+    private static final class TlsSocket {
+        final Socket socket;
+        final Context restoreWifiContext;
+
+        TlsSocket(Socket socket, Context restoreWifiContext) {
+            this.socket = socket;
+            this.restoreWifiContext = restoreWifiContext;
+        }
+    }
+
+    private static TlsSocket connectTlsSocket(Context c) throws IOException {
+        Context app = c.getApplicationContext() != null ? c.getApplicationContext() : c;
+        boolean tempWifi = false;
+        if (android.provider.Settings.Global.getInt(app.getContentResolver(), "adb_wifi_enabled", 0) == 0) {
+            tempWifi = setWifiAdb(app, true);
+            if (!tempWifi) throw new IOException(Ui.tr("debugging is off on the TV (port 5555 closed)"));
+        }
+        try {
+            InetSocketAddress endpoint = discoverLocalTlsEndpoint(app, tempWifi ? 6_000 : 3_500);
+            if (endpoint == null) throw new IOException(Ui.tr("debugging is off on the TV (port 5555 closed)"));
+            Socket s = new Socket();
+            try {
+                s.connect(new InetSocketAddress("127.0.0.1", endpoint.getPort()), 3_000);
+            } catch (IOException loopbackFailed) {
+                try { s.close(); } catch (IOException ignored) {}
+                s = new Socket();
+                try {
+                    s.connect(endpoint, 3_000);
+                } catch (IOException directFailed) {
+                    try { s.close(); } catch (IOException ignored) {}
+                    throw directFailed;
+                }
+            }
+            return new TlsSocket(s, tempWifi ? app : null);
+        } catch (IOException | RuntimeException e) {
+            if (tempWifi) setWifiAdb(app, false);
+            if (e instanceof IOException) throw (IOException) e;
+            throw new IOException(e);
+        }
+    }
+
+    private static boolean setWifiAdb(Context c, boolean enabled) {
+        if (c.checkSelfPermission("android.permission.WRITE_SECURE_SETTINGS")
+                != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            return false;
+        }
+        try {
+            return android.provider.Settings.Global.putInt(c.getContentResolver(), "adb_wifi_enabled", enabled ? 1 : 0);
+        } catch (SecurityException e) {
+            return false;
+        }
+    }
+
+    private static InetSocketAddress discoverLocalTlsEndpoint(Context c, long timeoutMs) {
+        android.net.nsd.NsdManager nsd = c.getSystemService(android.net.nsd.NsdManager.class);
+        if (nsd == null) return null;
+        final TlsDiscovery state = new TlsDiscovery(nsd, localInterfaceAddresses());
+        android.net.nsd.NsdManager.DiscoveryListener discovery = new android.net.nsd.NsdManager.DiscoveryListener() {
+            @Override public void onDiscoveryStarted(String serviceType) {}
+            @Override public void onDiscoveryStopped(String serviceType) {}
+            @Override public void onServiceLost(android.net.nsd.NsdServiceInfo info) {}
+            @Override public void onStopDiscoveryFailed(String serviceType, int errorCode) {}
+            @Override public void onStartDiscoveryFailed(String serviceType, int errorCode) { state.abort(); }
+            @Override public void onServiceFound(android.net.nsd.NsdServiceInfo info) { state.enqueue(info); }
+        };
+        try {
+            nsd.discoverServices("_adb-tls-connect._tcp.", android.net.nsd.NsdManager.PROTOCOL_DNS_SD, discovery);
+            return state.await(timeoutMs);
+        } catch (RuntimeException e) {
+            return null;
+        } finally {
+            try { nsd.stopServiceDiscovery(discovery); } catch (RuntimeException ignored) {}
+        }
+    }
+
+    private static final class TlsDiscovery {
+        private final android.net.nsd.NsdManager nsd;
+        private final java.util.List<byte[]> localAddrs;
+        private final java.util.Deque<android.net.nsd.NsdServiceInfo> queue = new java.util.ArrayDeque<>();
+        private boolean resolving;
+        private boolean done;
+        private InetSocketAddress found;
+
+        TlsDiscovery(android.net.nsd.NsdManager nsd, java.util.List<byte[]> localAddrs) {
+            this.nsd = nsd;
+            this.localAddrs = localAddrs;
+        }
+
+        void abort() {
+            synchronized (this) {
+                done = true;
+                notifyAll();
+            }
+        }
+
+        void enqueue(android.net.nsd.NsdServiceInfo info) {
+            android.net.nsd.NsdServiceInfo toResolve = null;
+            synchronized (this) {
+                if (done) return;
+                queue.addLast(info);
+                if (!resolving) {
+                    toResolve = queue.pollFirst();
+                    resolving = toResolve != null;
+                }
+            }
+            if (toResolve != null) resolve(toResolve);
+        }
+
+        @SuppressWarnings("deprecation")
+        private void resolve(android.net.nsd.NsdServiceInfo target) {
+            try {
+                nsd.resolveService(target, new android.net.nsd.NsdManager.ResolveListener() {
+                    @Override public void onResolveFailed(android.net.nsd.NsdServiceInfo info, int errorCode) {
+                        advance(null);
+                    }
+                    @Override public void onServiceResolved(android.net.nsd.NsdServiceInfo info) {
+                        java.net.InetAddress host = info.getHost();
+                        int port = info.getPort();
+                        InetSocketAddress match = (host != null && port > 0 && isLocalAddress(host, localAddrs))
+                                ? new InetSocketAddress(host, port) : null;
+                        advance(match);
+                    }
+                });
+            } catch (RuntimeException e) {
+                advance(null);
+            }
+        }
+
+        private void advance(InetSocketAddress match) {
+            android.net.nsd.NsdServiceInfo next = null;
+            synchronized (this) {
+                resolving = false;
+                if (match != null && !done) {
+                    found = match;
+                    done = true;
+                    notifyAll();
+                    return;
+                }
+                if (!done && !queue.isEmpty()) {
+                    next = queue.pollFirst();
+                    resolving = next != null;
+                }
+            }
+            if (next != null) resolve(next);
+        }
+
+        InetSocketAddress await(long timeoutMs) {
+            long deadline = android.os.SystemClock.elapsedRealtime() + timeoutMs;
+            synchronized (this) {
+                while (!done) {
+                    long remaining = deadline - android.os.SystemClock.elapsedRealtime();
+                    if (remaining <= 0) break;
+                    try {
+                        wait(remaining);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
+                }
+                done = true;
+                return found;
+            }
+        }
+    }
+
+    private static java.util.List<byte[]> localInterfaceAddresses() {
+        java.util.List<byte[]> out = new java.util.ArrayList<>();
+        try {
+            java.util.Enumeration<java.net.NetworkInterface> nifs = java.net.NetworkInterface.getNetworkInterfaces();
+            while (nifs != null && nifs.hasMoreElements()) {
+                java.net.NetworkInterface ni = nifs.nextElement();
+                java.util.Enumeration<java.net.InetAddress> addrs = ni.getInetAddresses();
+                while (addrs.hasMoreElements()) out.add(addrs.nextElement().getAddress());
+            }
+        } catch (IOException | RuntimeException ignored) {}
+        return out;
+    }
+
+    private static boolean isLocalAddress(java.net.InetAddress host, java.util.List<byte[]> localAddrs) {
+        if (host.isLoopbackAddress()) return true;
+        byte[] target = host.getAddress();
+        for (byte[] local : localAddrs) {
+            if (java.util.Arrays.equals(target, local)) return true;
+        }
+        return false;
+    }
+
+    static javax.net.ssl.SSLSocketFactory tlsSocketFactory(KeyPair keys) throws IOException {
+        try {
+            final java.security.cert.X509Certificate cert = selfSignedCert(keys);
+            final java.security.PrivateKey priv = keys.getPrivate();
+            javax.net.ssl.KeyManager km = new javax.net.ssl.X509ExtendedKeyManager() {
+                private final String[] aliases = { "adb" };
+                @Override public String[] getClientAliases(String keyType, java.security.Principal[] issuers) {
+                    return "RSA".equalsIgnoreCase(keyType) ? aliases : null;
+                }
+                @Override public String chooseClientAlias(String[] keyTypes, java.security.Principal[] issuers, Socket socket) {
+                    return "adb";
+                }
+                @Override public String[] getServerAliases(String keyType, java.security.Principal[] issuers) { return null; }
+                @Override public String chooseServerAlias(String keyType, java.security.Principal[] issuers, Socket socket) { return null; }
+                @Override public java.security.cert.X509Certificate[] getCertificateChain(String alias) {
+                    return "adb".equals(alias) ? new java.security.cert.X509Certificate[]{ cert } : null;
+                }
+                @Override public java.security.PrivateKey getPrivateKey(String alias) {
+                    return "adb".equals(alias) ? priv : null;
+                }
+            };
+            // adbd uses an ephemeral self-signed certificate; TLS mutual auth verifies our authorized RSA key
+            // while connecting strictly to a verified local loopback / device interface.
+            javax.net.ssl.TrustManager tm = new javax.net.ssl.X509TrustManager() {
+                @Override public void checkClientTrusted(java.security.cert.X509Certificate[] chain, String authType) {}
+                @Override public void checkServerTrusted(java.security.cert.X509Certificate[] chain, String authType) {}
+                @Override public java.security.cert.X509Certificate[] getAcceptedIssuers() {
+                    return new java.security.cert.X509Certificate[0];
+                }
+            };
+            javax.net.ssl.SSLContext sslCtx;
+            try {
+                sslCtx = javax.net.ssl.SSLContext.getInstance("TLSv1.3");
+            } catch (java.security.NoSuchAlgorithmException ignored) {
+                sslCtx = javax.net.ssl.SSLContext.getInstance("TLS");
+            }
+            sslCtx.init(new javax.net.ssl.KeyManager[]{ km }, new javax.net.ssl.TrustManager[]{ tm }, new java.security.SecureRandom());
+            return sslCtx.getSocketFactory();
+        } catch (java.security.GeneralSecurityException e) {
+            throw new IOException(e);
+        }
+    }
+
+    static java.security.cert.X509Certificate selfSignedCert(KeyPair keys) throws IOException {
+        try {
+            byte[] version = der(0xA0, new byte[]{ 0x02, 0x01, 0x02 });
+            byte[] serial = new byte[]{ 0x02, 0x01, 0x01 };
+            byte[] cnOid = new byte[]{ 0x06, 0x03, 0x55, 0x04, 0x03 };
+            byte[] cnVal = der(0x0C, "FreeMyTV".getBytes(StandardCharsets.UTF_8));
+            byte[] name = der(0x30, der(0x31, der(0x30, cnOid, cnVal)));
+            byte[] notBefore = der(0x17, "700101000000Z".getBytes(StandardCharsets.US_ASCII));
+            byte[] notAfter = der(0x17, "491231235959Z".getBytes(StandardCharsets.US_ASCII));
+            byte[] validity = der(0x30, notBefore, notAfter);
+            byte[] tbs = der(0x30, version, serial, SHA256_RSA_ALG, name, validity, name, keys.getPublic().getEncoded());
+
+            java.security.Signature sig = java.security.Signature.getInstance("SHA256withRSA");
+            sig.initSign(keys.getPrivate());
+            sig.update(tbs);
+            byte[] rawSig = sig.sign();
+            byte[] sigBits = der(0x03, new byte[]{ 0x00 }, rawSig);
+            byte[] certDer = der(0x30, tbs, SHA256_RSA_ALG, sigBits);
+
+            java.security.cert.CertificateFactory cf = java.security.cert.CertificateFactory.getInstance("X.509");
+            return (java.security.cert.X509Certificate) cf.generateCertificate(new java.io.ByteArrayInputStream(certDer));
+        } catch (java.security.GeneralSecurityException e) {
+            throw new IOException(e);
+        }
+    }
+
+    private static byte[] der(int tag, byte[]... parts) {
+        int len = 0;
+        for (byte[] p : parts) len += p.length;
+        java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream(len + 6);
+        bos.write(tag);
+        if (len < 128) {
+            bos.write(len);
+        } else if (len <= 0xff) {
+            bos.write(0x81);
+            bos.write(len);
+        } else if (len <= 0xffff) {
+            bos.write(0x82);
+            bos.write((len >> 8) & 0xff);
+            bos.write(len & 0xff);
+        } else {
+            bos.write(0x83);
+            bos.write((len >> 16) & 0xff);
+            bos.write((len >> 8) & 0xff);
+            bos.write(len & 0xff);
+        }
+        for (byte[] p : parts) bos.write(p, 0, p.length);
+        return bos.toByteArray();
     }
 
     private Message read() throws IOException {

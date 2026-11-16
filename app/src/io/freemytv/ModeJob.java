@@ -36,7 +36,7 @@ public class ModeJob extends JobService {
             try {
                 switch (action) {
                     case APPLY: HomeMode.applyNow(app, mode); break;
-                    case VERIFY: HomeMode.verifyNow(app); break;
+                    case VERIFY: HomeMode.verifyNow(app, mode); break;
                     case REVERT: HomeMode.revertHomeNow(app); break;
                     case MEMORY: HomeMode.measureMemoryNow(app, mode); break;
                     case REMOTE: HomeMode.ensureRemoteServiceNow(app); break;
@@ -75,6 +75,10 @@ public class ModeJob extends JobService {
      * (elapsedRealtime, the same in every process), which a switch's job leaves behind once it runs ({@link #started}).
      */
     static long schedule(Context c, String action, String mode, long delayMs) {
+        return schedule(c, action, mode, delayMs, false);
+    }
+
+    static long schedule(Context c, String action, String mode, long delayMs, boolean needNetwork) {
         long at = SystemClock.elapsedRealtime();
         JobScheduler scheduler = c.getSystemService(JobScheduler.class);
         if (scheduler == null) return at;
@@ -85,7 +89,12 @@ public class ModeJob extends JobService {
         JobInfo.Builder job = new JobInfo.Builder(id(action),
                 new ComponentName(c, ModeJob.class)).setExtras(extras);
         if (delayMs > 0) job.setMinimumLatency(delayMs);
-        job.setOverrideDeadline(delayMs + 2_000);
+        if (needNetwork) {
+            job.setRequiredNetworkType(JobInfo.NETWORK_TYPE_ANY);
+            job.setOverrideDeadline(Math.max(delayMs + 2_000, 180_000L));
+        } else {
+            job.setOverrideDeadline(delayMs + 2_000);
+        }
         scheduler.schedule(job.build());
         return at;
     }

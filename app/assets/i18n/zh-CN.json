@@ -393,7 +393,6 @@
  "services|Some": "部分",
  "shelf|Off": "关",
  "talkback|Sunrise {time}": "日出 {time}",
- "the TV asked for TLS (wireless debugging); use USB debugging": "电视要求 TLS（无线调试）；请使用 USB 调试",
  "the TV rejected the app's key": "电视拒绝了应用的密钥",
  "the TV's ADB didn't respond": "电视的 ADB 没有响应",
  "the TV's factory home screen": "电视的出厂主屏幕",

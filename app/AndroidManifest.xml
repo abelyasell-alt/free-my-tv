@@ -23,11 +23,19 @@
          granted at install; from 12 it is asked for when Status icons is turned on (and only the icon needs it). -->
     <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <!-- Lets the conversational voice assistant capture spoken questions from the remote mic. -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- Lets the app turn Wireless Debugging back on by itself after a restart on Android 14+ when port 5555 is
+         closed; ADB grants this permission on the first connection and Free My TV turns the setting right back off. -->
+    <uses-permission android:name="android.permission.WRITE_SECURE_SETTINGS" />
 
     <!-- Android 11+: without this list the app can't "see" the other apps (getLeanbackLaunchIntentForPackage
          returns null). The shelf and streaming apps, the live TV apps and, through the <intent>, every TV app
          (for "All Apps"). -->
     <queries>
+        <!-- Google Cast receiver and setup package: watched for updates and kept working while TV home is off. -->
+        <package android:name="com.google.android.apps.mediashell" />
+        <package android:name="com.google.android.tungsten.setupwraith" />
         <!-- Optional App Store top button: Google Play or Amazon Appstore. -->
         <package android:name="com.android.vending" />
         <package android:name="com.amazon.venezia" />
@@ -40,6 +48,8 @@
         <package android:name="com.disney.disneyplus" />
         <package android:name="com.wbd.stream" />
         <package android:name="com.hbo.hbonow" />
+        <package android:name="com.hbo.hbomax" />
+        <package android:name="com.stremio.one" />
         <package android:name="com.apple.atve.androidtv.appletv" />
         <package android:name="com.apple.atve.sony.appletv" />
         <package android:name="com.apple.atve.amazon.appletv" />
@@ -95,6 +105,15 @@
         <intent>
             <action android:name="android.intent.action.VIEW" />
             <data android:scheme="content" android:host="android.media.tv" />
+        </intent>
+        <intent>
+            <action android:name="android.speech.RecognitionService" />
+        </intent>
+        <intent>
+            <action android:name="android.speech.action.RECOGNIZE_SPEECH" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.TTS_SERVICE" />
         </intent>
     </queries>
 
@@ -266,6 +285,51 @@
             android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
             <intent-filter>
                 <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
+
+        <!-- Voice assistant overlay and Digital Assistant integration (handles the remote mic / Assist button). -->
+        <activity
+            android:name=".VoiceActivity"
+            android:process=":home"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:taskAffinity="io.freemytv.voice"
+            android:excludeFromRecents="true"
+            android:configChanges="keyboard|keyboardHidden|navigation|orientation|screenSize|screenLayout|smallestScreenSize|uiMode|density|fontScale|locale|layoutDirection"
+            android:theme="@style/FreeMyTV.Voice">
+            <intent-filter>
+                <action android:name="android.intent.action.ASSIST" />
+                <action android:name="android.intent.action.VOICE_COMMAND" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
+
+        <service
+            android:name=".VoiceAssistantService"
+            android:exported="true"
+            android:label="Free My TV"
+            android:permission="android.permission.BIND_VOICE_INTERACTION">
+            <meta-data
+                android:name="android.voice_interaction"
+                android:resource="@xml/voice_interaction_service" />
+            <intent-filter>
+                <action android:name="android.service.voice.VoiceInteractionService" />
+            </intent-filter>
+        </service>
+
+        <service
+            android:name=".VoiceAssistantSessionService"
+            android:exported="true"
+            android:permission="android.permission.BIND_VOICE_INTERACTION" />
+
+        <service
+            android:name=".VoiceRecognitionBridgeService"
+            android:exported="true"
+            android:label="Free My TV">
+            <intent-filter>
+                <action android:name="android.speech.RecognitionService" />
+                <category android:name="android.intent.category.DEFAULT" />
             </intent-filter>
         </service>
 

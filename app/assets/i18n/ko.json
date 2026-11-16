@@ -393,7 +393,6 @@
  "services|Some": "일부",
  "shelf|Off": "끔",
  "talkback|Sunrise {time}": "일출 {time}",
- "the TV asked for TLS (wireless debugging); use USB debugging": "TV가 TLS(무선 디버깅)를 요청했습니다. USB 디버깅을 사용하세요",
  "the TV rejected the app's key": "TV가 앱의 키를 거부했습니다",
  "the TV's ADB didn't respond": "TV의 ADB가 응답하지 않았습니다",
  "the TV's factory home screen": "TV의 출고 시 홈 화면",

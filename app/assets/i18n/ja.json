@@ -393,7 +393,6 @@
  "services|Some": "一部",
  "shelf|Off": "オフ",
  "talkback|Sunrise {time}": "日の出 {time}",
- "the TV asked for TLS (wireless debugging); use USB debugging": "テレビが TLS（ワイヤレス デバッグ）を求めました。USB デバッグを使ってください",
  "the TV rejected the app's key": "テレビがアプリの鍵を拒否しました",
  "the TV's ADB didn't respond": "テレビの ADB が応答しませんでした",
  "the TV's factory home screen": "テレビの工場出荷時のホーム画面",

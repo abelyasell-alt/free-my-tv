@@ -73,6 +73,13 @@ final class Trakt {
         final List<Progress> progress = new ArrayList<>();
         final List<String> watchlistMovies = new ArrayList<>(), watchlistShows = new ArrayList<>();
         final List<String> recommendedMovies = new ArrayList<>(), recommendedShows = new ArrayList<>();
+        final List<String> tasteTitles = new ArrayList<>();
+        final List<String> likedTitles = new ArrayList<>();
+        final List<String> dislikedTitles = new ArrayList<>();
+        final List<String> recentWatchedTitles = new ArrayList<>();
+        final List<String> watchlistTitles = new ArrayList<>();
+        final Map<String, String> imdbIds = new HashMap<>();
+        final Map<String, String> titles = new HashMap<>();
     }
 
     // Sign-in in progress (Settings shows it in the Trakt row); null when none.
@@ -220,7 +227,7 @@ final class Trakt {
         if (refresh.isEmpty()) throw new IOException("not signed in");
         if (System.currentTimeMillis() < sp.getLong("expires", 0) - 3600_000L) return sp.getString("access", "");
         Response r = send("POST", "/oauth/token", new JSONObject().put("refresh_token", refresh).put("client_id", clientId())
-                .put("redirect_uri", "urn:ietf:wg:oauth:2.0:oob").put("grant_type", "refresh_token"), null);
+                .put("redirect_uri", "http://localhost").put("grant_type", "refresh_token"), null);
         if (r.code == 400 || r.code == 401) {
             // The person disconnected the app on trakt.tv (or the token is gone): signed out here too.
             sp.edit().clear().apply();
@@ -245,8 +252,21 @@ final class Trakt {
             AppLog.w("trakt activity: " + e.getMessage());
         }
         Map<String, String> watchedAt = new HashMap<>();
-        watched(c, "/sync/watched/movies", "movie", out.watched, watchedAt);
-        List<Seen> shows = watched(c, "/sync/watched/shows?extended=noseasons", "show", out.watched, watchedAt);
+        List<Seen> movies = watched(c, "/sync/watched/movies", "movie", out.watched, watchedAt, out);
+        List<Seen> shows = watched(c, "/sync/watched/shows?extended=noseasons", "show", out.watched, watchedAt, out);
+        try {
+            ratings(c, "/sync/ratings/movies/8,9,10", "movie", out.likedTitles, 30);
+            ratings(c, "/sync/ratings/shows/8,9,10", "show", out.likedTitles, 30);
+            ratings(c, "/sync/ratings/movies/1,2,3,4,5", "movie", out.dislikedTitles, 20);
+            ratings(c, "/sync/ratings/shows/1,2,3,4,5", "show", out.dislikedTitles, 20);
+        } catch (Exception e) {
+            AppLog.w("trakt ratings: " + e.getMessage());
+        }
+        out.tasteTitles.addAll(out.likedTitles);
+        addRecentSeenToTaste(shows, out.tasteTitles, 15);
+        addRecentSeenToTaste(movies, out.tasteTitles, 15);
+        addRecentSeenToTaste(movies, out.recentWatchedTitles, 45);
+        addRecentSeenToTaste(shows, out.recentWatchedTitles, 35);
         // Each part on its own: one Trakt endpoint failing leaves the others.
         try {
             playback(c, out, watchedAt);
@@ -258,21 +278,100 @@ final class Trakt {
         } catch (Exception e) {
             AppLog.w("trakt up next: " + e.getMessage());
         }
-        watchlist(c, "/sync/watchlist/movies", "movie", out.watchlistMovies);
-        watchlist(c, "/sync/watchlist/shows", "show", out.watchlistShows);
+        watchlist(c, "/sync/watchlist/movies", "movie", out.watchlistMovies, out);
+        watchlist(c, "/sync/watchlist/shows", "show", out.watchlistShows, out);
         try {
-            recommended(c, "/recommendations/movies?ignore_collected=true&limit=" + RECOMMENDED_MAX * 2, "movie", out.recommendedMovies);
-            recommended(c, "/recommendations/shows?ignore_collected=true&limit=" + RECOMMENDED_MAX * 2, "show", out.recommendedShows);
+            recommended(c, "/recommendations/movies?ignore_collected=true&limit=" + RECOMMENDED_MAX * 2, "movie", out.recommendedMovies, out);
+            recommended(c, "/recommendations/shows?ignore_collected=true&limit=" + RECOMMENDED_MAX * 2, "show", out.recommendedShows, out);
         } catch (Exception e) {
             AppLog.w("trakt recommendations: " + e.getMessage());
         }
+        String rich = formatRichTaste(out);
+        Set<String> plainSeen = new HashSet<>();
+        for (Seen s : movies) if (s.title != null && !s.title.isEmpty()) plainSeen.add(Recs.plain(s.title));
+        for (Seen s : shows) if (s.title != null && !s.title.isEmpty()) plainSeen.add(Recs.plain(s.title));
+        sp(c).edit()
+                .putString("taste", String.join(", ", out.tasteTitles))
+                .putString("tasteRich", rich)
+                .putInt("tasteVer", 2)
+                .putStringSet("watchedKeys", new HashSet<>(out.watched))
+                .putStringSet("watchedPlainTitles", plainSeen)
+                .putLong("tasteAt", System.currentTimeMillis())
+                .apply();
         return out;
+    }
+
+    /** Returns a structured taste + exclusion summary from the user's Trakt profile for Gemini AI. */
+    static String tasteSummary(Context c) {
+        if (!signedIn(c)) return "";
+        SharedPreferences s = sp(c);
+        String cached = s.getString("tasteRich", "");
+        long age = System.currentTimeMillis() - s.getLong("tasteAt", 0);
+        if (s.getInt("tasteVer", 0) >= 2 && !cached.isEmpty() && age >= 0 && age < 3600_000L) return cached;
+        try {
+            Lists l = lists(c);
+            String rich = formatRichTaste(l);
+            if (!rich.isEmpty()) return rich;
+        } catch (Exception e) {
+            AppLog.w("trakt taste: " + e.getMessage());
+        }
+        return !cached.isEmpty() ? cached : s.getString("taste", "");
+    }
+
+    /** True if the title or TMDB id is already present in the user's Trakt watched history. */
+    static boolean isWatched(Context c, String kind, int tmdbId, String title, String origTitle) {
+        if (!signedIn(c)) return false;
+        SharedPreferences s = sp(c);
+        if (tmdbId > 0 && kind != null) {
+            Set<String> keys = s.getStringSet("watchedKeys", null);
+            if (keys != null && keys.contains(kind + ":" + tmdbId)) return true;
+        }
+        Set<String> titles = s.getStringSet("watchedPlainTitles", null);
+        if (titles == null || titles.isEmpty()) return false;
+        if (title != null && !title.isEmpty() && titles.contains(Recs.plain(title))) return true;
+        return origTitle != null && !origTitle.isEmpty() && titles.contains(Recs.plain(origTitle));
+    }
+
+    private static String formatRichTaste(Lists l) {
+        StringBuilder sb = new StringBuilder();
+        if (!l.likedTitles.isEmpty()) {
+            sb.append("LE ENCANTÓ (8-10/10 en Trakt): ").append(String.join(", ", l.likedTitles)).append("\n");
+        }
+        if (!l.dislikedTitles.isEmpty()) {
+            sb.append("NO LE GUSTÓ (1-5/10 en Trakt, evita ese estilo o títulos parecidos): ")
+                    .append(String.join(", ", l.dislikedTitles)).append("\n");
+        }
+        if (!l.watchlistTitles.isEmpty()) {
+            sb.append("TIENE EN SU WATCHLIST (puedes incluir alguna si coincide): ")
+                    .append(String.join(", ", l.watchlistTitles)).append("\n");
+        }
+        if (!l.recentWatchedTitles.isEmpty()) {
+            sb.append("YA VISTO EN TRAKT (PROHIBIDO volver a recomendar cualquiera de estos): ")
+                    .append(String.join(", ", l.recentWatchedTitles));
+        }
+        return sb.toString().trim();
+    }
+
+    private static void addRecentSeenToTaste(List<Seen> list, List<String> dest, int max) {
+        List<Seen> copy = new ArrayList<>(list);
+        Collections.sort(copy, (x, y) -> y.at.compareTo(x.at));
+        int count = 0;
+        for (Seen s : copy) {
+            if (count >= max) break;
+            if (s.title != null && !s.title.isEmpty()) {
+                String label = s.year > 0 ? s.title + " (" + s.year + ")" : s.title;
+                if (!dest.contains(label) && !dest.contains(s.title)) {
+                    dest.add(label);
+                    count++;
+                }
+            }
+        }
     }
 
     /** A show from /sync/watched/shows: what upNext needs. */
     private static final class Seen {
-        String key, at;
-        int trakt;
+        String key, at, title, imdb;
+        int trakt, year;
     }
 
     /**
@@ -280,13 +379,13 @@ final class Trakt {
      * last_watched_at in the past, but last_updated_at is when it was marked. Read as it arrives (a long history is
      * megabytes of JSON): only the ids and the two dates are kept.
      */
-    private static List<Seen> watched(Context c, String path, String type, Set<String> out, Map<String, String> at) throws Exception {
+    private static List<Seen> watched(Context c, String path, String type, Set<String> out, Map<String, String> at, Lists lists) throws Exception {
         List<Seen> seen = new ArrayList<>();
         stream(c, path, r -> {
             r.beginArray();
             while (r.hasNext()) {
-                String watchedAt = "", updatedAt = "";
-                int tmdb = 0, trakt = 0;
+                String watchedAt = "", updatedAt = "", itemTitle = "", imdb = "";
+                int tmdb = 0, trakt = 0, year = 0;
                 r.beginObject();
                 while (r.hasNext()) {
                     String name = r.nextName();
@@ -295,12 +394,16 @@ final class Trakt {
                     else if (name.equals(type) && r.peek() == JsonToken.BEGIN_OBJECT) {
                         r.beginObject();
                         while (r.hasNext()) {
-                            if (r.nextName().equals("ids") && r.peek() == JsonToken.BEGIN_OBJECT) {
+                            String field = r.nextName();
+                            if (field.equals("title")) itemTitle = string(r);
+                            else if (field.equals("year")) year = number(r);
+                            else if (field.equals("ids") && r.peek() == JsonToken.BEGIN_OBJECT) {
                                 r.beginObject();
                                 while (r.hasNext()) {
                                     String id = r.nextName();
                                     if (id.equals("tmdb")) tmdb = number(r);
                                     else if (id.equals("trakt")) trakt = number(r);
+                                    else if (id.equals("imdb")) imdb = string(r);
                                     else r.skipValue();
                                 }
                                 r.endObject();
@@ -318,10 +421,15 @@ final class Trakt {
                 Seen item = new Seen();
                 item.key = (type.equals("show") ? "tv" : "movie") + ":" + tmdb;
                 item.at = watchedAt.compareTo(updatedAt) > 0 ? watchedAt : updatedAt;
+                item.title = itemTitle;
+                item.imdb = imdb;
                 item.trakt = trakt;
+                item.year = year;
                 out.add(item.key);
                 at.put(item.key, item.at);
-                if (type.equals("show")) seen.add(item);
+                if (!imdb.isEmpty()) lists.imdbIds.put(item.key, imdb);
+                if (!itemTitle.isEmpty()) lists.titles.put(item.key, itemTitle);
+                seen.add(item);
             }
             r.endArray();
         });
@@ -356,7 +464,7 @@ final class Trakt {
         Collections.sort(items, (x, y) -> y.optString("paused_at").compareTo(x.optString("paused_at")));
         for (JSONObject item : items) {
             boolean movie = "movie".equals(item.optString("type"));
-            String key = key(item, movie ? "movie" : "show");
+            String key = key(item, movie ? "movie" : "show", out);
             JSONObject ep = movie ? null : item.optJSONObject("episode");
             if (key == null || has(out.progress, key)) continue;
             String watched = watchedAt.get(key);
@@ -386,25 +494,52 @@ final class Trakt {
         return false;
     }
 
+    /** Rated titles for Gemini AI taste profile (likes and dislikes). */
+    private static void ratings(Context c, String path, String type, List<String> dest, int limit) throws Exception {
+        JSONArray a = new JSONArray(get(c, path));
+        for (int i = 0; i < a.length() && dest.size() < limit; i++) {
+            JSONObject item = a.optJSONObject(i);
+            JSONObject o = item == null ? null : item.optJSONObject(type);
+            if (o == null) continue;
+            String title = o.optString("title", "");
+            int year = o.optInt("year", 0);
+            int rating = item.optInt("rating", 0);
+            if (!title.isEmpty()) {
+                String label = year > 0 ? title + " (" + year + ")" : title;
+                String entry = rating > 0 ? label + " [" + rating + "/10]" : label;
+                if (!dest.contains(entry) && !dest.contains(title)) dest.add(entry);
+            }
+        }
+    }
+
     /** Trakt's recommendations for the account, in its order. */
-    private static void recommended(Context c, String path, String type, List<String> out) throws Exception {
+    private static void recommended(Context c, String path, String type, List<String> out, Lists lists) throws Exception {
         JSONArray a = new JSONArray(get(c, path));
         for (int i = 0; i < a.length() && out.size() < RECOMMENDED_MAX; i++) {
-            String key = key(a.optJSONObject(i), type);
+            String key = key(a.optJSONObject(i), type, lists);
             if (key != null && !out.contains(key)) out.add(key);
         }
     }
 
     /** The newest additions first (listed_at is ISO 8601 in UTC, so it sorts as text). */
-    private static void watchlist(Context c, String path, String type, List<String> out) throws Exception {
+    private static void watchlist(Context c, String path, String type, List<String> out, Lists lists) throws Exception {
         JSONArray a = new JSONArray(get(c, path));
         List<JSONObject> items = new ArrayList<>();
         for (int i = 0; i < a.length(); i++) if (a.optJSONObject(i) != null) items.add(a.optJSONObject(i));
         Collections.sort(items, (x, y) -> y.optString("listed_at").compareTo(x.optString("listed_at")));
         for (JSONObject item : items) {
             if (out.size() >= WATCHLIST_MAX) break;
-            String key = key(item, type);
-            if (key != null && !out.contains(key)) out.add(key);
+            String key = key(item, type, lists);
+            if (key != null && !out.contains(key)) {
+                out.add(key);
+                String t = lists.titles.get(key);
+                if (t != null && !t.isEmpty() && !lists.watchlistTitles.contains(t)) {
+                    lists.watchlistTitles.add(t);
+                    if (lists.tasteTitles.size() < 60 && !lists.tasteTitles.contains(t)) {
+                        lists.tasteTitles.add(t + " (en mi Watchlist)");
+                    }
+                }
+            }
         }
     }
 
@@ -412,11 +547,19 @@ final class Trakt {
      * {"movie": {"ids": {"tmdb": 603}}} → "movie:603"; Trakt's "show" is TMDB's "tv". The recommendations come without
      * the wrapper ({"ids": …}). Null without a TMDB id.
      */
-    private static String key(JSONObject item, String type) {
+    private static String key(JSONObject item, String type, Lists lists) {
         JSONObject o = item == null ? null : item.has(type) ? item.optJSONObject(type) : item;
         JSONObject ids = o == null ? null : o.optJSONObject("ids");
         int tmdb = ids == null ? 0 : ids.optInt("tmdb");
-        return tmdb > 0 ? (type.equals("show") ? "tv" : "movie") + ":" + tmdb : null;
+        if (tmdb <= 0) return null;
+        String k = (type.equals("show") ? "tv" : "movie") + ":" + tmdb;
+        if (lists != null) {
+            String imdb = ids.optString("imdb", "");
+            String title = o.optString("title", "");
+            if (!imdb.isEmpty()) lists.imdbIds.put(k, imdb);
+            if (!title.isEmpty()) lists.titles.put(k, title);
+        }
+        return k;
     }
 
     // MARK: - HTTP
