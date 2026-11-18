@@ -110,18 +110,25 @@ public class SettingsActivity extends Activity {
 
     @Override public boolean dispatchKeyEvent(KeyEvent event) {
         if (preview != null) {
-            // Like the real screensaver: arrows, OK or Back close it (other keys go on to the system); with Watch from the
+            int code = event.getKeyCode();
+            if (code == KeyEvent.KEYCODE_DPAD_LEFT || code == KeyEvent.KEYCODE_DPAD_RIGHT) {
+                if (event.getAction() == KeyEvent.ACTION_DOWN) {
+                    if (!preview.step(code == KeyEvent.KEYCODE_DPAD_RIGHT ? 1 : -1)) closePreview();
+                }
+                return true;
+            }
+            // Like the real screensaver: Up, Down, OK or Back close it (other keys go on to the system); with Watch from the
             // screensaver on, OK opens the title first.
-            switch (event.getKeyCode()) {
+            switch (code) {
                 case KeyEvent.KEYCODE_DPAD_UP:
                 case KeyEvent.KEYCODE_DPAD_DOWN:
-                case KeyEvent.KEYCODE_DPAD_LEFT:
-                case KeyEvent.KEYCODE_DPAD_RIGHT:
                 case KeyEvent.KEYCODE_DPAD_CENTER:
                 case KeyEvent.KEYCODE_ENTER:
+                case KeyEvent.KEYCODE_NUMPAD_ENTER:
                 case KeyEvent.KEYCODE_BACK:
                     if (event.getAction() == KeyEvent.ACTION_UP) {
-                        boolean ok = event.getKeyCode() == KeyEvent.KEYCODE_DPAD_CENTER || event.getKeyCode() == KeyEvent.KEYCODE_ENTER;
+                        boolean ok = code == KeyEvent.KEYCODE_DPAD_CENTER || code == KeyEvent.KEYCODE_ENTER
+                                || code == KeyEvent.KEYCODE_NUMPAD_ENTER;
                         if (ok && Prefs.saverWatch()) preview.watch();
                         closePreview();
                     }

@@ -12,6 +12,11 @@ import android.view.KeyEvent;
 public class Screensaver extends DreamService {
     private DreamView view;
 
+    @Override public void onCreate() {
+        super.onCreate();
+        setInteractive(true);
+    }
+
     @Override public void onAttachedToWindow() {
         super.onAttachedToWindow();
         Watchdog.install(this);
@@ -19,7 +24,7 @@ public class Screensaver extends DreamService {
         // Also here, not only when the home screen resumes: on Android 11 the dream is in the main process, and a TV
         // that idles here would go days without the home screen's check. ScreensaverAlone has reloaded the settings.
         ImmichPhotos.syncIfDue(this, null);
-        setInteractive(Prefs.saverWatch());   // interactive: the keys come here instead of waking the TV
+        setInteractive(true);   // interactive: arrow keys step photos, and other keys close the screensaver
         setFullscreen(true);
         setScreenBright(true);
         view = new DreamView(this);
@@ -29,7 +34,14 @@ public class Screensaver extends DreamService {
     @Override public boolean dispatchKeyEvent(KeyEvent event) {
         if (!isInteractive()) return super.dispatchKeyEvent(event);
         int code = event.getKeyCode();
-        boolean ok = code == KeyEvent.KEYCODE_DPAD_CENTER || code == KeyEvent.KEYCODE_ENTER || code == KeyEvent.KEYCODE_NUMPAD_ENTER;
+        if (code == KeyEvent.KEYCODE_DPAD_LEFT || code == KeyEvent.KEYCODE_DPAD_RIGHT) {
+            if (event.getAction() == KeyEvent.ACTION_DOWN) {
+                if (view == null || !view.step(code == KeyEvent.KEYCODE_DPAD_RIGHT ? 1 : -1)) finish();
+            }
+            return true;
+        }
+        boolean ok = Prefs.saverWatch() && (code == KeyEvent.KEYCODE_DPAD_CENTER
+                || code == KeyEvent.KEYCODE_ENTER || code == KeyEvent.KEYCODE_NUMPAD_ENTER);
         // OK acts when it's released, so the app it opens doesn't get the release; any other key closes at once.
         if (ok ? event.getAction() == KeyEvent.ACTION_UP : event.getAction() == KeyEvent.ACTION_DOWN) {
             if (ok && view != null) view.watch();

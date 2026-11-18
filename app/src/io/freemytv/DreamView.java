@@ -22,9 +22,18 @@ import android.text.TextUtils;
 import android.view.Choreographer;
 import android.view.View;
 
+import java.io.BufferedReader;
 import java.io.File;
+import java.io.FileOutputStream;
+import java.io.FileReader;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -43,7 +52,7 @@ import java.util.concurrent.Executors;
  * Without photos (no TMDB key, or before the first fetch): the big clock over the night aurora.
  */
 final class DreamView extends View implements Choreographer.FrameCallback, HomeData.Listener, Recs.Listener {
-    private static final long SHOW_MS = 30_000, FADE_MS = 3_000, FIRST_MS = 1_600;
+    private static final long SHOW_MS = 600_000, FADE_MS = 3_000, FIRST_MS = 1_600;
     private static final float ZOOM = 0.1f;
     /** Photos 10% larger than the screen (the zoom goes up to 1.1 without upscaling). */
     private static final int PW = 2112, PH = 1188;
@@ -123,7 +132,12 @@ final class DreamView extends View implements Choreographer.FrameCallback, HomeD
     private final Paint black = new Paint();
     private final Paint shadowPaint = new Paint(Paint.FILTER_BITMAP_FLAG);
     private final Paint glassPaint = new Paint();
-    private final Set<String> failed = new HashSet<>();     // Recs.key: a movie and a series can have the same ID
+    private final Set<String> failed = new HashSet<>();     // pickKey: filename for user photos, Recs.key for picks
+    private final List<String> order = new ArrayList<>();
+    private final Object orderLock = new Object();
+    private int orderIndex = -1, loadGen;
+    private String lastKey = "";
+    private boolean orderLoaded, wrapPrepared, stepPending;
     private RuntimeShader glassShader;
     private boolean running, dirty = true, chromeDirty = true;
     private boolean fallback;       // the aurora with the clock (no photos)
@@ -157,6 +171,8 @@ final class DreamView extends View implements Choreographer.FrameCallback, HomeD
 
     DreamView(Context c) {
         super(c);
+        setFocusable(true);
+        setFocusableInTouchMode(true);
         data = HomeData.get(c);
         recs = Recs.get(c);
         playing = new NowPlaying.Watch(c, () -> {
@@ -185,6 +201,11 @@ final class DreamView extends View implements Choreographer.FrameCallback, HomeD
         startedAt = clock();
         lastFrame = 0;
         failed.clear();
+        orderLoaded = false;
+        order.clear();
+        orderIndex = -1;
+        lastKey = "";
+        wrapPrepared = false;
         fallback = photos().isEmpty();
         data.addListener(this);
         recs.addListener(this);
@@ -203,7 +224,10 @@ final class DreamView extends View implements Choreographer.FrameCallback, HomeD
         if (!running) return;
         running = false;
         generation++;
+        loadGen++;
         decoding = false;
+        stepPending = false;
+        if (!lastKey.isEmpty() && !order.isEmpty()) writeOrderNow(lastKey, new ArrayList<>(order));
         Choreographer.getInstance().removeFrameCallback(this);
         handler.removeCallbacks(tick);
         playing.stop();
@@ -287,43 +311,204 @@ final class DreamView extends View implements Choreographer.FrameCallback, HomeD
         return Photos.on(getContext()) ? Photos.picks(getContext()) : recs.showcase();
     }
 
+    /** Stable photo identifier: filename for user photos, TMDB key for picks. */
+    private static String pickKey(Recs.Pick p) {
+        return p.photo != null ? "photo:" + p.photo.getName() : Recs.key(p);
+    }
+
+    private File orderFile() {
+        return new File(getContext().getFilesDir(), "dream-order.txt");
+    }
+
+    private void loadOrder() {
+        if (orderLoaded) return;
+        orderLoaded = true;
+        File f = orderFile();
+        if (!f.exists()) return;
+        try (BufferedReader r = new BufferedReader(new FileReader(f))) {
+            String first = r.readLine();
+            if (first != null) lastKey = first.trim();
+            String line;
+            while ((line = r.readLine()) != null) {
+                line = line.trim();
+                if (!line.isEmpty() && !order.contains(line)) order.add(line);
+            }
+        } catch (IOException ignored) {
+        }
+    }
+
+    private void writeOrderNow(String savedLast, List<String> savedOrder) {
+        StringBuilder sb = new StringBuilder();
+        sb.append(savedLast).append('\n');
+        for (String key : savedOrder) sb.append(key).append('\n');
+        byte[] bytes = sb.toString().getBytes(StandardCharsets.UTF_8);
+        synchronized (orderLock) {
+            File f = orderFile();
+            File tmp = new File(f.getParentFile(), "dream-order.tmp");
+            try (FileOutputStream out = new FileOutputStream(tmp)) {
+                out.write(bytes);
+                out.getFD().sync();
+            } catch (IOException e) {
+                //noinspection ResultOfMethodCallIgnored
+                tmp.delete();
+                return;
+            }
+            //noinspection ResultOfMethodCallIgnored
+            tmp.renameTo(f);
+        }
+    }
+
+    private void saveOrder() {
+        if (worker.isShutdown()) return;
+        final String savedLast = lastKey;
+        final List<String> savedOrder = new ArrayList<>(order);
+        worker.execute(() -> writeOrderNow(savedLast, savedOrder));
+    }
+
+    /** Keeps the persisted shuffle aligned with the available non-failed photos and positions orderIndex at lastKey. */
+    private Map<String, Recs.Pick> syncOrder(List<Recs.Pick> list) {
+        loadOrder();
+        Map<String, Recs.Pick> byKey = new HashMap<>();
+        for (Recs.Pick p : list) {
+            String key = pickKey(p);
+            if (!failed.contains(key)) byKey.put(key, p);
+        }
+        order.retainAll(byKey.keySet());
+        Set<String> present = new HashSet<>(order);
+        List<String> added = new ArrayList<>();
+        for (Recs.Pick p : list) {
+            String key = pickKey(p);
+            if (byKey.containsKey(key) && present.add(key)) added.add(key);
+        }
+        if (!added.isEmpty()) {
+            Collections.shuffle(added);
+            order.addAll(added);
+        }
+        if (order.isEmpty()) {
+            orderIndex = -1;
+            return byKey;
+        }
+        int idx = lastKey.isEmpty() ? -1 : order.indexOf(lastKey);
+        if (idx >= 0) {
+            orderIndex = idx;
+        } else {
+            orderIndex = orderIndex < 0 ? 0 : Math.min(orderIndex, order.size() - 1);
+            lastKey = order.get(orderIndex);
+        }
+        if (orderIndex == order.size() - 1 && order.size() > 2 && !wrapPrepared) {
+            Collections.shuffle(order.subList(0, order.size() - 1));
+            wrapPrepared = true;
+            orderIndex = order.size() - 1;
+        }
+        if (!added.isEmpty() || idx < 0) saveOrder();
+        return byKey;
+    }
+
+    private void stepForward() {
+        boolean wrapped = orderIndex == order.size() - 1;
+        orderIndex = (orderIndex + 1) % order.size();
+        if (wrapped && order.size() > 2) {
+            int swap = 1 + (int) (Math.random() * (order.size() - 1));
+            Collections.swap(order, swap, order.size() - 1);
+            wrapPrepared = false;
+        }
+        if (orderIndex == order.size() - 1 && order.size() > 2 && !wrapPrepared) {
+            Collections.shuffle(order.subList(0, order.size() - 1));
+            wrapPrepared = true;
+        }
+        lastKey = order.get(orderIndex);
+        saveOrder();
+    }
+
+    private void release(Slide s) {
+        if (s == null) return;
+        Bitmap img = s.image, fr = s.frost;
+        handler.postDelayed(() -> {
+            if ((current == null || current.image != img) && (incoming == null || incoming.image != img)
+                    && (prepared == null || prepared.image != img)) {
+                img.recycle();
+                fr.recycle();
+            }
+        }, 1000);
+    }
+
+    /** Steps forward (dir > 0) or back (dir < 0) with the remote's arrow keys. Returns false if there are no photos. */
+    boolean step(int dir) {
+        if (!running) return false;
+        List<Recs.Pick> list = photos();
+        if (list.isEmpty()) return false;
+        syncOrder(list);
+        if (order.isEmpty()) return false;
+        if (current == null) return true;
+        if (incoming != null) {
+            release(current);
+            current = incoming;
+            incoming = null;
+            bindPhotos();
+        }
+        if (dir > 0) {
+            stepForward();
+        } else {
+            orderIndex = (orderIndex - 1 + order.size()) % order.size();
+            wrapPrepared = false;
+            lastKey = order.get(orderIndex);
+            saveOrder();
+        }
+        if (prepared != null && pickKey(prepared.pick).equals(lastKey)) {
+            release(current);
+            current = prepared;
+            prepared = null;
+            current.startedAt = clock();
+            stepPending = false;
+            bindPhotos();
+            prepareNext();
+            invalidate();
+            return true;
+        }
+        release(prepared);
+        prepared = null;
+        stepPending = true;
+        loadGen++;
+        decoding = false;
+        prepareNext();
+        invalidate();
+        return true;
+    }
+
     /** Loads the next photo in the background (one at a time); once ready, it comes in at the right moment. */
     private void prepareNext() {
         if (!running || decoding || prepared != null) return;
         List<Recs.Pick> list = photos();
         if (list.isEmpty()) return;
-        Slide last = incoming != null ? incoming : current;
-        int start = 0;
-        if (last != null) {
-            for (int i = 0; i < list.size(); i++) {
-                if (Recs.key(list.get(i)).equals(Recs.key(last.pick))) {
-                    start = i + 1;
-                    break;
-                }
-            }
-        }
-        Recs.Pick pick = null;
-        for (int i = 0; i < list.size() && pick == null; i++) {
-            Recs.Pick p = list.get((start + i) % list.size());
-            if (!failed.contains(Recs.key(p))) pick = p;
-        }
-        if (pick == null) {
+        Map<String, Recs.Pick> byKey = syncOrder(list);
+        if (order.isEmpty()) {
             if (current == null) fallback = true;
             return;
         }
-        if (last != null && Recs.key(pick).equals(Recs.key(last.pick))) {
+        Slide last = incoming != null ? incoming : current;
+        boolean immediate = current == null || stepPending;
+        String wantKey = order.get(immediate ? orderIndex : (orderIndex + 1) % order.size());
+        Recs.Pick pick = byKey.get(wantKey);
+        if (pick == null) return;
+        if (last != null && pickKey(pick).equals(pickKey(last.pick))) {
             // Only one photo: the same one again, with a different motion.
+            if (stepPending) {
+                stepPending = false;
+                current.startedAt = clock();
+                invalidate();
+                return;
+            }
             prepared = newSlide(pick, last.image, last.frost, last.lightCaption, last.lightClock, last.whole);
             return;
         }
         File file = pick.photo != null ? (pick.photo.exists() ? pick.photo : null) : recs.readyImage(pick);
         if (file == null) {
-            failed.add(Recs.key(pick));   // the image is gone from disk: try the next one
+            failed.add(pickKey(pick));   // the image is gone from disk: try the next one
             prepareNext();
             return;
         }
         decoding = true;
-        final int gen = generation;
+        final int gen = generation, lgen = loadGen;
         final Recs.Pick chosen = pick;
         worker.execute(() -> {
             Bitmap[] images = null;
@@ -339,26 +524,37 @@ final class DreamView extends View implements Choreographer.FrameCallback, HomeD
                     whole = !Photos.fills(size.outWidth, size.outHeight);
                 }
                 images = Backdrop.photo(file, PW, PH, light, whole ? 0xFF000000 : 0);
-                images[0] = Backdrop.gpu(withScrims(images[0], chosen.photo == null, light[0], light[1]));
+                images[0] = Backdrop.gpu(chosen.photo == null ? withScrims(images[0], true, light[0], light[1]) : images[0]);
             } catch (Exception | OutOfMemoryError e) {
                 AppLog.w("screensaver: photo for “" + (chosen.photo != null ? chosen.photo.getName() : chosen.title) + "”: " + e.getMessage());
             }
             final Bitmap[] ready = images;
             final boolean shownWhole = whole;
             handler.post(() -> {
-                if (gen != generation) {
-                    // The screensaver closed while the photo was loading: free the memory right away.
+                if (gen != generation || lgen != loadGen) {
+                    // The screensaver closed or stepped to another photo while this one was loading: free its memory.
                     if (ready != null) for (Bitmap b : ready) b.recycle();
                     return;
                 }
                 decoding = false;
                 if (ready == null) {
-                    failed.add(Recs.key(chosen));
+                    failed.add(pickKey(chosen));
                     prepareNext();
                     return;
                 }
-                prepared = newSlide(chosen, ready[0], ready[1], light[0], light[1], shownWhole);
-                invalidate();
+                Slide slide = newSlide(chosen, ready[0], ready[1], light[0], light[1], shownWhole);
+                if (stepPending && current != null) {
+                    stepPending = false;
+                    release(current);
+                    current = slide;
+                    current.startedAt = clock();
+                    bindPhotos();
+                    prepareNext();
+                    invalidate();
+                } else {
+                    prepared = slide;
+                    invalidate();
+                }
             });
         });
     }
@@ -369,7 +565,7 @@ final class DreamView extends View implements Choreographer.FrameCallback, HomeD
         return s;
     }
 
-    /** The prepared photo goes on screen when its turn comes (the first one right away; the others every 30 s). */
+    /** The prepared photo goes on screen when its turn comes (the first one right away; the others every SHOW_MS). */
     private void advance(long up) {
         if (current == null) {
             if (prepared == null) return;
@@ -377,6 +573,8 @@ final class DreamView extends View implements Choreographer.FrameCallback, HomeD
             prepared = null;
             current.startedAt = up;
             firstAt = up;
+            lastKey = pickKey(current.pick);
+            saveOrder();
             bindPhotos();
             prepareNext();
             return;
@@ -385,6 +583,7 @@ final class DreamView extends View implements Choreographer.FrameCallback, HomeD
             incoming = prepared;
             prepared = null;
             incoming.startedAt = up;
+            stepForward();
             bindPhotos();
             return;
         }
@@ -393,14 +592,7 @@ final class DreamView extends View implements Choreographer.FrameCallback, HomeD
             current = incoming;
             incoming = null;
             bindPhotos();
-            if (old.image != current.image) {
-                // Once the last frame that uses them has been drawn.
-                Bitmap gone = old.image, goneFrost = old.frost;
-                handler.postDelayed(() -> {
-                    gone.recycle();
-                    goneFrost.recycle();
-                }, 1000);
-            }
+            release(old);
             prepareNext();
         }
     }
@@ -465,7 +657,6 @@ final class DreamView extends View implements Choreographer.FrameCallback, HomeD
             chromeDirty = true;
         }
         if (running) advance(up);
-        if (!glassFor.equals(clock)) buildGlass(clock);
 
         float first = current == null ? 0 : fadeIn(up - firstAt, FIRST_MS);
         if (current == null || first < 1) {
@@ -483,14 +674,6 @@ final class DreamView extends View implements Choreographer.FrameCallback, HomeD
             drawPhoto(canvas, incoming, placeB, e);
         }
 
-        if (chromeDirty) recordChrome();
-        chrome.setAlpha(first);
-        chrome.draw(canvas);
-        if (playingCorner != null) {
-            float x = RIGHT * k - playingCornerWidth - cornerCap * 0.6f - NowPlaying.barsWidth(cornerCap);
-            drawBars(canvas, x, cornerBase, cornerCap, cornerQuote.getColor(), first);
-        }
-        drawGlass(canvas, first, e);
         drawCaptions(canvas, up);
     }
 
@@ -528,10 +711,11 @@ final class DreamView extends View implements Choreographer.FrameCallback, HomeD
      * they move a little along with the photo, which makes no difference to the text.
      */
     private static Bitmap withScrims(Bitmap photo, boolean withCaption, float lightCaption, float lightClock) {
+        if (!withCaption) return photo;
         int w = photo.getWidth(), h = photo.getHeight();
         Canvas c = new Canvas(photo);
         Paint p = new Paint(Paint.DITHER_FLAG);
-        float caption = withCaption ? scrimStrength(lightCaption, 0.5f) : 0, corner = scrimStrength(lightClock, 0.42f);
+        float caption = scrimStrength(lightCaption, 0.5f);
         p.setShader(new LinearGradient(0, h, 0, h * 0.42f,
                 new int[] {black(0.55f * caption), black(0.33f * caption), black(0.11f * caption), 0},
                 new float[] {0, 0.35f, 0.7f, 1}, Shader.TileMode.CLAMP));
@@ -544,18 +728,6 @@ final class DreamView extends View implements Choreographer.FrameCallback, HomeD
         around.setLocalMatrix(m);
         p.setShader(around);
         c.drawRect(0, h - w * 0.7f * 0.62f, w * 0.7f, h, p);
-        p.setShader(new LinearGradient(0, 0, 0, h * 0.3f, new int[] {black(0.3f), black(0.075f), 0},
-                new float[] {0, 0.45f, 1}, Shader.TileMode.CLAMP));
-        c.drawRect(0, 0, w, h * 0.3f, p);
-        float cx = w * 0.86f, cy = h * 0.15f;
-        RadialGradient clockSide = new RadialGradient(cx, cy, w * 0.36f,
-                new int[] {black(corner), black(0.6f * corner), black(0.15f * corner), 0},
-                new float[] {0, 0.42f, 0.75f, 1}, Shader.TileMode.CLAMP);
-        Matrix mc = new Matrix();
-        mc.setScale(1, 0.72f, cx, cy);
-        clockSide.setLocalMatrix(mc);
-        p.setShader(clockSide);
-        c.drawRect(w * 0.5f, 0, w, cy + w * 0.36f * 0.72f, p);
         return photo;
     }
 
